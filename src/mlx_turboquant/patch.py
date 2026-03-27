@@ -6,13 +6,21 @@ Two approaches:
    mlx_lm generate pipeline uses TurboQuantCache automatically.
 2. make_turboquant_cache() — returns a cache list you can pass directly
    as prompt_cache to generate_step().
+
+Phase 2: Also monkey-patches scaled_dot_product_attention in mlx_lm.models.base
+to compute attention scores directly from compressed data via Metal kernels,
+eliminating the decompress-every-step bottleneck.
 """
 
 from typing import Optional
 
+import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_turboquant.cache import TurboQuantCache
+
+# Global flag to ensure we only patch attention once
+_attention_patched = False
 
 
 def _detect_head_dim(model: nn.Module) -> int:
@@ -66,6 +74,182 @@ def _detect_num_layers(model: nn.Module) -> int:
     return len(layers)
 
 
+def _turboquant_attention(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    cache: TurboQuantCache,
+    scale: float,
+    mask: Optional[mx.array],
+) -> mx.array:
+    """
+    Compute attention with compressed + buffer data.
+
+    keys/values are the BUFFER-ONLY portion from update_and_fetch().
+    Compressed portion is accessed via cache._keys_compressed.
+
+    Flow:
+      1. Metal kernel scores on compressed keys (no decompression!)
+      2. Standard matmul scores on buffer keys (small, fast)
+      3. Concatenate [compressed | buffer], apply mask, softmax
+      4. Decompress values once, weighted sum
+    """
+    B, n_heads, n_q, D = queries.shape
+
+    # 1. Compressed scores via Metal kernels (no decompression!)
+    compressed_scores = cache.compute_compressed_scores(queries, scale=scale)
+
+    # 2. Buffer scores via standard matmul (small, fast)
+    # keys shape: (B, n_kv_heads, n_buf, D)
+    # Handle GQA: expand KV heads to match query heads
+    n_kv_heads = keys.shape[1]
+    n_repeats = n_heads // n_kv_heads
+    if n_repeats > 1:
+        buf_keys = mx.repeat(keys, n_repeats, axis=1)
+        buf_values = mx.repeat(values, n_repeats, axis=1)
+    else:
+        buf_keys = keys
+        buf_values = values
+
+    buffer_scores = (
+        queries @ mx.transpose(buf_keys, (0, 1, 3, 2))
+    ) * scale  # (B, H, n_q, n_buf)
+
+    # 3. Concatenate scores: [compressed | buffer]
+    if compressed_scores is not None:
+        all_scores = mx.concatenate([compressed_scores, buffer_scores], axis=-1)
+    else:
+        all_scores = buffer_scores
+
+    # 4. Apply mask if provided
+    if mask is not None:
+        if isinstance(mask, str) and mask == "causal":
+            # For decode (n_q=1), causal mask is a no-op
+            # For prefill, we need to build the mask
+            if n_q > 1:
+                total_kv = all_scores.shape[-1]
+                offset = cache.offset - n_q
+                q_indices = mx.arange(offset, offset + n_q)[:, None]
+                k_indices = mx.arange(total_kv)[None, :]
+                causal = q_indices >= k_indices
+                all_scores = mx.where(
+                    causal, all_scores, mx.finfo(all_scores.dtype).min
+                )
+        elif isinstance(mask, mx.array):
+            if mask.dtype == mx.bool_:
+                # Boolean mask -- need to adjust size for compressed tokens
+                n_compressed = (
+                    compressed_scores.shape[-1]
+                    if compressed_scores is not None
+                    else 0
+                )
+                n_buf = buffer_scores.shape[-1]
+                total = n_compressed + n_buf
+                # Mask may be sized for buffer only; expand if needed
+                if mask.shape[-1] == total:
+                    all_scores = mx.where(
+                        mask, all_scores, mx.finfo(all_scores.dtype).min
+                    )
+                elif mask.shape[-1] == n_buf and n_compressed > 0:
+                    # Mask covers only buffer; compressed tokens are always visible
+                    compressed_mask = mx.ones(
+                        (*mask.shape[:-1], n_compressed), dtype=mx.bool_
+                    )
+                    full_mask = mx.concatenate(
+                        [compressed_mask, mask], axis=-1
+                    )
+                    all_scores = mx.where(
+                        full_mask, all_scores, mx.finfo(all_scores.dtype).min
+                    )
+                else:
+                    all_scores = mx.where(
+                        mask, all_scores, mx.finfo(all_scores.dtype).min
+                    )
+            else:
+                # Float additive mask
+                n_compressed = (
+                    compressed_scores.shape[-1]
+                    if compressed_scores is not None
+                    else 0
+                )
+                n_buf = buffer_scores.shape[-1]
+                total = n_compressed + n_buf
+                if mask.shape[-1] == total:
+                    all_scores = all_scores + mask
+                elif mask.shape[-1] == n_buf and n_compressed > 0:
+                    pad = mx.zeros((*mask.shape[:-1], n_compressed))
+                    full_mask = mx.concatenate([pad, mask], axis=-1)
+                    all_scores = all_scores + full_mask
+                else:
+                    all_scores = all_scores + mask
+
+    # 5. Softmax
+    weights = mx.softmax(all_scores, axis=-1, precise=True)
+
+    # 6. Decompress values (once per step, not per-score)
+    decompressed_vals = cache.get_decompressed_values()
+
+    if decompressed_vals is not None:
+        # Handle GQA for values
+        if n_repeats > 1:
+            decompressed_vals = mx.repeat(decompressed_vals, n_repeats, axis=1)
+        all_values = mx.concatenate([decompressed_vals, buf_values], axis=2)
+    else:
+        all_values = buf_values
+
+    # 7. Compute output
+    output = weights @ all_values  # (B, H, n_q, D)
+
+    return output
+
+
+def _patch_attention():
+    """
+    Monkey-patch mlx_lm's scaled_dot_product_attention to detect
+    TurboQuantCache and route through Metal kernels for compressed data.
+    """
+    import mlx_lm.models.base as base_module
+
+    original_sdpa = base_module.scaled_dot_product_attention
+
+    def patched_sdpa(
+        queries,
+        keys,
+        values,
+        cache,
+        scale: float,
+        mask=None,
+        sinks=None,
+    ):
+        # Route through Metal kernel attention ONLY for decode (n_q=1)
+        # with compressed data. Prefill (n_q>1) uses standard attention
+        # because Metal kernels loop per query position and are slower.
+        n_q = queries.shape[2]
+        if (isinstance(cache, TurboQuantCache)
+            and cache._keys_compressed is not None
+            and n_q == 1):
+            return _turboquant_attention(
+                queries, keys, values, cache, scale, mask
+            )
+
+        # Default path: standard attention (used for prefill and non-TQ caches)
+        # For TQ cache during prefill, keys/values are buffer-only, which is
+        # fine because during prefill all tokens are in the buffer before flush.
+        if isinstance(cache, TurboQuantCache) and cache._keys_compressed is not None and n_q > 1:
+            # Prefill with compressed data: decompress and use standard path
+            all_keys = cache._get_all_keys()
+            all_values = cache._get_all_values()
+            return original_sdpa(
+                queries, all_keys, all_values, cache=None, scale=scale, mask=mask, sinks=sinks,
+            )
+
+        return original_sdpa(
+            queries, keys, values, cache=cache, scale=scale, mask=mask, sinks=sinks,
+        )
+
+    base_module.scaled_dot_product_attention = patched_sdpa
+
+
 def make_turboquant_cache(
     model: nn.Module,
     key_bits: int = 3,
@@ -77,6 +261,9 @@ def make_turboquant_cache(
 ) -> list[TurboQuantCache]:
     """
     Create a list of TurboQuantCache objects for use as prompt_cache.
+
+    Also patches scaled_dot_product_attention (once) to handle
+    compressed data via Metal kernels.
 
     Args:
         model: An MLX-LM model.
@@ -90,6 +277,11 @@ def make_turboquant_cache(
     Returns:
         List of TurboQuantCache, one per layer.
     """
+    global _attention_patched
+    if not _attention_patched:
+        _patch_attention()
+        _attention_patched = True
+
     if head_dim is None:
         head_dim = _detect_head_dim(model)
     if num_layers is None:
@@ -120,7 +312,8 @@ def patch_model(
     Monkey-patch an MLX-LM model to use TurboQuantCache.
 
     After patching, mlx_lm.generate() and stream_generate() will
-    automatically use TurboQuant KV compression.
+    automatically use TurboQuant KV compression with Phase 2 direct
+    attention (Metal kernels on compressed data).
 
     Args:
         model: An MLX-LM model to patch.
@@ -133,6 +326,11 @@ def patch_model(
     Returns:
         The same model (patched in-place).
     """
+    global _attention_patched
+    if not _attention_patched:
+        _patch_attention()
+        _attention_patched = True
+
     if head_dim is None:
         head_dim = _detect_head_dim(model)
 
