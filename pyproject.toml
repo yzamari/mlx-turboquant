@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlx-turboquant"
+version = "0.1.0"
+description = "TurboQuant KV cache compression for MLX-LM inference on Apple Silicon"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+dependencies = [
+    "mlx>=0.22",
+    "mlx-lm>=0.22",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "turboquant-mac @ git+https://github.com/yzamari/turboQuantPlayground.git",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+mlx-tq-generate = "mlx_turboquant.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
