@@ -7,9 +7,13 @@ Two approaches:
 2. make_turboquant_cache() — returns a cache list you can pass directly
    as prompt_cache to generate_step().
 
-Phase 2: Also monkey-patches scaled_dot_product_attention in mlx_lm.models.base
-to compute attention scores directly from compressed data via Metal kernels,
-eliminating the decompress-every-step bottleneck.
+Phase 2: Monkey-patches scaled_dot_product_attention in mlx_lm.models.base
+to compute attention scores directly from compressed keys via Metal kernels.
+
+Phase 3: ZERO DECOMPRESSION path — values are also never decompressed.
+A fused Metal kernel computes the weighted sum of quantized values on-the-fly,
+avoiding the (B, H, N_compressed, D) intermediate tensor entirely.
+Neither keys nor values are ever materialized in full-precision during decode.
 """
 
 from typing import Optional
@@ -74,6 +78,52 @@ def _detect_num_layers(model: nn.Module) -> int:
     return len(layers)
 
 
+def _apply_mask(all_scores, mask, compressed_scores, buffer_scores, cache, n_q):
+    """Apply attention mask to concatenated scores [compressed | buffer]."""
+    if mask is None:
+        return all_scores
+
+    if isinstance(mask, str) and mask == "causal":
+        if n_q > 1:
+            total_kv = all_scores.shape[-1]
+            offset = cache.offset - n_q
+            q_indices = mx.arange(offset, offset + n_q)[:, None]
+            k_indices = mx.arange(total_kv)[None, :]
+            causal = q_indices >= k_indices
+            all_scores = mx.where(
+                causal, all_scores, mx.finfo(all_scores.dtype).min
+            )
+        return all_scores
+
+    if not isinstance(mask, mx.array):
+        return all_scores
+
+    n_compressed = (
+        compressed_scores.shape[-1] if compressed_scores is not None else 0
+    )
+    n_buf = buffer_scores.shape[-1]
+    total = n_compressed + n_buf
+
+    if mask.dtype == mx.bool_:
+        if mask.shape[-1] == total:
+            return mx.where(mask, all_scores, mx.finfo(all_scores.dtype).min)
+        elif mask.shape[-1] == n_buf and n_compressed > 0:
+            compressed_mask = mx.ones(
+                (*mask.shape[:-1], n_compressed), dtype=mx.bool_
+            )
+            full_mask = mx.concatenate([compressed_mask, mask], axis=-1)
+            return mx.where(full_mask, all_scores, mx.finfo(all_scores.dtype).min)
+        return mx.where(mask, all_scores, mx.finfo(all_scores.dtype).min)
+    else:
+        if mask.shape[-1] == total:
+            return all_scores + mask
+        elif mask.shape[-1] == n_buf and n_compressed > 0:
+            pad = mx.zeros((*mask.shape[:-1], n_compressed))
+            full_mask = mx.concatenate([pad, mask], axis=-1)
+            return all_scores + full_mask
+        return all_scores + mask
+
+
 def _turboquant_attention(
     queries: mx.array,
     keys: mx.array,
@@ -83,25 +133,26 @@ def _turboquant_attention(
     mask: Optional[mx.array],
 ) -> mx.array:
     """
-    Compute attention with compressed + buffer data.
+    Compute attention with compressed + buffer data -- ZERO decompression path.
 
     keys/values are the BUFFER-ONLY portion from update_and_fetch().
-    Compressed portion is accessed via cache._keys_compressed.
+    Compressed portion is accessed via cache._keys_compressed / _values_compressed.
 
-    Flow:
-      1. Metal kernel scores on compressed keys (no decompression!)
+    Phase 3 flow (NO intermediate decompression):
+      1. Metal kernel scores on compressed keys (no key decompression)
       2. Standard matmul scores on buffer keys (small, fast)
       3. Concatenate [compressed | buffer], apply mask, softmax
-      4. Decompress values once, weighted sum
+      4. Split weights into compressed vs buffer portions
+      5. Fused Metal kernel: weights @ quantized_values (no value decompression!)
+      6. Standard matmul: buffer_weights @ buffer_values (small, fast)
+      7. Sum the two partial outputs
     """
     B, n_heads, n_q, D = queries.shape
 
-    # 1. Compressed scores via Metal kernels (no decompression!)
+    # 1. Compressed scores via Metal kernels (no key decompression!)
     compressed_scores = cache.compute_compressed_scores(queries, scale=scale)
 
     # 2. Buffer scores via standard matmul (small, fast)
-    # keys shape: (B, n_kv_heads, n_buf, D)
-    # Handle GQA: expand KV heads to match query heads
     n_kv_heads = keys.shape[1]
     n_repeats = n_heads // n_kv_heads
     if n_repeats > 1:
@@ -117,88 +168,40 @@ def _turboquant_attention(
 
     # 3. Concatenate scores: [compressed | buffer]
     if compressed_scores is not None:
+        n_compressed = compressed_scores.shape[-1]
         all_scores = mx.concatenate([compressed_scores, buffer_scores], axis=-1)
     else:
+        n_compressed = 0
         all_scores = buffer_scores
 
-    # 4. Apply mask if provided
-    if mask is not None:
-        if isinstance(mask, str) and mask == "causal":
-            # For decode (n_q=1), causal mask is a no-op
-            # For prefill, we need to build the mask
-            if n_q > 1:
-                total_kv = all_scores.shape[-1]
-                offset = cache.offset - n_q
-                q_indices = mx.arange(offset, offset + n_q)[:, None]
-                k_indices = mx.arange(total_kv)[None, :]
-                causal = q_indices >= k_indices
-                all_scores = mx.where(
-                    causal, all_scores, mx.finfo(all_scores.dtype).min
-                )
-        elif isinstance(mask, mx.array):
-            if mask.dtype == mx.bool_:
-                # Boolean mask -- need to adjust size for compressed tokens
-                n_compressed = (
-                    compressed_scores.shape[-1]
-                    if compressed_scores is not None
-                    else 0
-                )
-                n_buf = buffer_scores.shape[-1]
-                total = n_compressed + n_buf
-                # Mask may be sized for buffer only; expand if needed
-                if mask.shape[-1] == total:
-                    all_scores = mx.where(
-                        mask, all_scores, mx.finfo(all_scores.dtype).min
-                    )
-                elif mask.shape[-1] == n_buf and n_compressed > 0:
-                    # Mask covers only buffer; compressed tokens are always visible
-                    compressed_mask = mx.ones(
-                        (*mask.shape[:-1], n_compressed), dtype=mx.bool_
-                    )
-                    full_mask = mx.concatenate(
-                        [compressed_mask, mask], axis=-1
-                    )
-                    all_scores = mx.where(
-                        full_mask, all_scores, mx.finfo(all_scores.dtype).min
-                    )
-                else:
-                    all_scores = mx.where(
-                        mask, all_scores, mx.finfo(all_scores.dtype).min
-                    )
-            else:
-                # Float additive mask
-                n_compressed = (
-                    compressed_scores.shape[-1]
-                    if compressed_scores is not None
-                    else 0
-                )
-                n_buf = buffer_scores.shape[-1]
-                total = n_compressed + n_buf
-                if mask.shape[-1] == total:
-                    all_scores = all_scores + mask
-                elif mask.shape[-1] == n_buf and n_compressed > 0:
-                    pad = mx.zeros((*mask.shape[:-1], n_compressed))
-                    full_mask = mx.concatenate([pad, mask], axis=-1)
-                    all_scores = all_scores + full_mask
-                else:
-                    all_scores = all_scores + mask
+    # 4. Apply mask
+    all_scores = _apply_mask(
+        all_scores, mask, compressed_scores, buffer_scores, cache, n_q
+    )
 
-    # 5. Softmax
-    weights = mx.softmax(all_scores, axis=-1, precise=True)
+    # 5. Softmax over all positions
+    attn_weights = mx.softmax(all_scores, axis=-1, precise=True)
 
-    # 6. Decompress values (once per step, not per-score)
-    decompressed_vals = cache.get_decompressed_values()
+    # 6. Compute output WITHOUT decompressing values
+    if n_compressed > 0:
+        # Split weights: compressed portion vs buffer portion
+        compressed_weights = attn_weights[..., :n_compressed]
+        buffer_weights = attn_weights[..., n_compressed:]
 
-    if decompressed_vals is not None:
-        # Handle GQA for values
-        if n_repeats > 1:
-            decompressed_vals = mx.repeat(decompressed_vals, n_repeats, axis=1)
-        all_values = mx.concatenate([decompressed_vals, buf_values], axis=2)
+        # Fused Metal kernel: weighted sum directly from quantized values
+        # No (B, H, N, D) decompressed tensor is ever created!
+        compressed_output = cache.compute_compressed_value_output(
+            compressed_weights
+        )
+
+        # Buffer portion: standard matmul (small, fast)
+        buffer_output = buffer_weights @ buf_values
+
+        # Sum partial outputs
+        output = compressed_output + buffer_output
     else:
-        all_values = buf_values
-
-    # 7. Compute output
-    output = weights @ all_values  # (B, H, n_q, D)
+        # No compressed data, standard buffer-only attention
+        output = attn_weights @ buf_values
 
     return output
 

@@ -44,6 +44,7 @@ class TurboQuantCache(_BaseCache):
         value_bits: int = 2,
         value_group_size: int = 32,
         buffer_size: int = 128,
+        flush_batch_size: int = 0,
         layer_idx: int = 0,
     ):
         self.head_dim = head_dim
@@ -51,6 +52,11 @@ class TurboQuantCache(_BaseCache):
         self.value_bits = value_bits
         self.value_group_size = value_group_size
         self.buffer_size = buffer_size
+        # Batch flush: accumulate this many tokens before compressing all at once.
+        # Default: same as buffer_size (128). This means flush happens every 128
+        # decode steps, compressing 128 tokens in one GPU-saturated batch, instead
+        # of compressing 1 token per step with 3 underutilized d×d matmuls.
+        self.flush_batch_size = flush_batch_size or buffer_size
         self.layer_idx = layer_idx
 
         # Key quantizer (per-layer seed for diversity)
@@ -105,9 +111,16 @@ class TurboQuantCache(_BaseCache):
 
         # During prefill: DON'T compress. Keep everything in buffer for fast
         # standard attention. Only start compressing during decode (n_new=1)
-        # when buffer overflows. This avoids the compress+decompress overhead
-        # during prefill which would make it slower and use MORE memory.
-        if not is_prefill and self._key_buffer.shape[2] > self.buffer_size:
+        # when buffer overflows past the batch threshold.
+        #
+        # CRITICAL OPTIMIZATION: flush in BATCHES, not one token at a time.
+        # With buffer_size=128 and flush_batch_size=128, the effective buffer
+        # is 256 tokens. When it hits 257, we flush 128 tokens in one batch.
+        # This means the 3 dense d×d matmuls (rotation, inverse rotation, QJL)
+        # operate on (128, d) instead of (1, d) — GPU-saturated instead of
+        # catastrophically underutilized. Amortized cost drops ~100x.
+        flush_threshold = self.buffer_size + self.flush_batch_size
+        if not is_prefill and self._key_buffer.shape[2] > flush_threshold:
             self._flush()
 
         # Return ONLY the buffer -- compressed data is handled by patched attention
@@ -311,6 +324,7 @@ class TurboQuantCache(_BaseCache):
     def get_decompressed_values(self) -> mx.array | None:
         """
         Decompress values from quantized storage (called once per step).
+        LEGACY: prefer compute_compressed_value_output() for zero-decompression path.
 
         Returns:
             (B, n_kv_heads, n_compressed, head_dim) or None.
@@ -322,6 +336,93 @@ class TurboQuantCache(_BaseCache):
             self.value_group_size,
             backend="mlx",
         )
+
+    def compute_compressed_value_output(
+        self, weights: mx.array
+    ) -> mx.array | None:
+        """
+        Compute weighted sum of compressed values WITHOUT decompressing them.
+
+        Uses a fused Metal kernel that dequantizes values on-the-fly in GPU
+        registers. The full (B, H, N, D) decompressed value tensor is NEVER
+        materialized in memory.
+
+        Args:
+            weights: (B, n_heads, n_q, n_compressed) attention weights
+                     (already softmaxed, sliced to compressed portion only).
+
+        Returns:
+            (B, n_heads, n_q, head_dim) weighted sum output,
+            or None if no compressed values exist.
+        """
+        if self._values_compressed is None:
+            return None
+
+        from turboquant_mac.backends.metal_kernels import (
+            turboquant_value_weighted_sum_metal,
+        )
+
+        vc = self._values_compressed
+        B, n_heads, n_q, n_compressed = weights.shape
+        D = self.head_dim
+
+        # Handle GQA: expand compressed values heads to match query heads
+        n_kv_heads = vc.data.shape[1]
+        repeats = n_heads // n_kv_heads
+
+        def _expand_kv_head(t, axis=1):
+            if repeats == 1:
+                return t
+            return mx.repeat(t, repeats, axis=axis)
+
+        val_data = _expand_kv_head(vc.data)       # (B, n_heads, N, packed_d)
+        val_scales = _expand_kv_head(vc.scales)    # (B, n_heads, N, n_groups)
+        val_zeros = _expand_kv_head(vc.zeros)      # (B, n_heads, N, n_groups)
+
+        if n_q == 1:
+            # Decode path: single query, optimal
+            # Flatten batch and heads: (B*H, N_compressed)
+            w_flat = weights.reshape(B * n_heads, n_compressed)
+            vd_flat = val_data.reshape(B * n_heads, n_compressed, -1)
+            vs_flat = val_scales.reshape(B * n_heads, n_compressed, -1)
+            vz_flat = val_zeros.reshape(B * n_heads, n_compressed, -1)
+
+            # Fused Metal kernel: (B*H, D)
+            out_flat = turboquant_value_weighted_sum_metal(
+                weights=w_flat,
+                packed_values=vd_flat,
+                scales=vs_flat,
+                zeros=vz_flat,
+                value_bits=self.value_bits,
+                group_size=self.value_group_size,
+                head_dim=D,
+            )
+            # (B*H, D) -> (B, n_heads, 1, D)
+            return out_flat.reshape(B, n_heads, 1, D)
+        else:
+            # Prefill path: loop over query positions
+            all_outputs = []
+            for qi in range(n_q):
+                w_qi = weights[:, :, qi, :]  # (B, n_heads, n_compressed)
+                w_flat = w_qi.reshape(B * n_heads, n_compressed)
+                vd_flat = val_data.reshape(B * n_heads, n_compressed, -1)
+                vs_flat = val_scales.reshape(B * n_heads, n_compressed, -1)
+                vz_flat = val_zeros.reshape(B * n_heads, n_compressed, -1)
+
+                out_flat = turboquant_value_weighted_sum_metal(
+                    weights=w_flat,
+                    packed_values=vd_flat,
+                    scales=vs_flat,
+                    zeros=vz_flat,
+                    value_bits=self.value_bits,
+                    group_size=self.value_group_size,
+                    head_dim=D,
+                )
+                all_outputs.append(out_flat)
+
+            # Stack: list of (B*H, D) -> (B*H, n_q, D) -> (B, H, n_q, D)
+            stacked = mx.stack(all_outputs, axis=1)
+            return stacked.reshape(B, n_heads, n_q, D)
 
     # ---- _BaseCache interface ----
 
