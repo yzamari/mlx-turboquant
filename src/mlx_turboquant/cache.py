@@ -220,6 +220,163 @@ class TurboQuantCache(_BaseCache):
             raise RuntimeError("Cache is empty, cannot get values")
         return mx.concatenate(parts, axis=2) if len(parts) > 1 else parts[0]
 
+    # ---- Fused decode: scores + softmax + value dequant in one GPU pass ----
+
+    def compute_fused_attention(
+        self, queries: mx.array, scale: float = 1.0
+    ) -> tuple[mx.array, mx.array, mx.array] | None:
+        """
+        Fused decode: compute scores + online softmax + value dequant + weighted
+        sum in a single Metal GPU pass. Zero intermediate tensors.
+
+        Args:
+            queries: (B, n_heads, 1, head_dim) query vectors (decode only).
+            scale: attention scale factor (typically 1/sqrt(d)).
+
+        Returns:
+            (acc, m, l) where:
+                acc: (B, n_heads, 1, D) unnormalized weighted accumulator
+                m: (B, n_heads, 1) running max for log-sum-exp merge
+                l: (B, n_heads, 1) running sum for log-sum-exp merge
+            or None if no compressed data exists.
+        """
+        if self._keys_compressed is None or self._values_compressed is None:
+            return None
+
+        from mlx_turboquant.metal.fused_decode import turboquant_fused_decode_metal
+
+        B, n_heads, n_q, D = queries.shape
+        kc = self._keys_compressed
+        vc = self._values_compressed
+
+        # Retrieve quantizer matrices
+        Pi = self.key_quantizer.mse_quantizer.Pi
+        S = self.key_quantizer.S
+        centroids = self.key_quantizer.mse_quantizer.centroids
+        mse_bits = self.key_bits  # e.g. 3 -> MSE uses 2 bits internally
+        qjl_scale = self.key_quantizer.qjl_scale
+
+        # Precompute rotated and sketched queries (once)
+        q_flat = queries.reshape(B * n_heads, D)
+        q_rot = mx.matmul(q_flat.astype(mx.float32), mx.transpose(Pi))    # (BH, D)
+        q_sketch = mx.matmul(q_flat.astype(mx.float32), mx.transpose(S))  # (BH, D)
+
+        # Handle GQA: n_heads (query) may differ from n_kv_heads (key)
+        n_kv_heads = kc.mse_indices.shape[1]
+        n_compressed = kc.mse_indices.shape[2]
+        repeats = n_heads // n_kv_heads
+
+        if repeats == 1:
+            # No GQA: flatten directly
+            acc, m, l = self._fused_flat(
+                q_rot, q_sketch, kc, vc, n_heads, n_compressed, B, D,
+                centroids, mse_bits, qjl_scale, scale,
+                turboquant_fused_decode_metal,
+            )
+        else:
+            # GQA: loop per KV head group
+            acc, m, l = self._fused_gqa(
+                q_rot, q_sketch, queries, kc, vc,
+                n_kv_heads, repeats, n_compressed, B, D,
+                Pi, S, centroids, mse_bits, qjl_scale, scale,
+                turboquant_fused_decode_metal,
+            )
+
+        # Reshape to (B, n_heads, 1, D), (B, n_heads, 1), (B, n_heads, 1)
+        acc = acc.reshape(B, n_heads, 1, D)
+        m = m.reshape(B, n_heads, 1)
+        l = l.reshape(B, n_heads, 1)
+        return acc, m, l
+
+    def _fused_flat(
+        self, q_rot, q_sketch, kc, vc, n_heads, n_compressed, B, D,
+        centroids, mse_bits, qjl_scale, sm_scale, kernel_fn,
+    ) -> tuple[mx.array, mx.array, mx.array]:
+        """Fused decode when n_heads == n_kv_heads (no GQA)."""
+        BH = B * n_heads
+        mse_flat = kc.mse_indices.reshape(BH, n_compressed, -1)
+        signs_flat = kc.qjl_signs.reshape(BH, n_compressed, -1)
+        norms_flat = kc.norms.reshape(BH, n_compressed)
+        res_norms_flat = kc.residual_norms.reshape(BH, n_compressed)
+
+        vd_flat = vc.data.reshape(BH, n_compressed, -1)
+        vs_flat = vc.scales.reshape(BH, n_compressed, -1)
+        vz_flat = vc.zeros.reshape(BH, n_compressed, -1)
+
+        acc, m, l = kernel_fn(
+            q_rot=q_rot, q_sketch=q_sketch,
+            mse=mse_flat, signs=signs_flat,
+            norms=norms_flat, res_norms=res_norms_flat,
+            centroids=centroids,
+            v_data=vd_flat, v_scales=vs_flat, v_zeros=vz_flat,
+            mse_bits=mse_bits, v_bits=self.value_bits,
+            D=D, group_size=self.value_group_size,
+            qjl_scale=qjl_scale, sm_scale=sm_scale,
+        )
+        return acc, m, l
+
+    def _fused_gqa(
+        self, q_rot, q_sketch, queries, kc, vc,
+        n_kv_heads, repeats, n_compressed, B, D,
+        Pi, S, centroids, mse_bits, qjl_scale, sm_scale, kernel_fn,
+    ) -> tuple[mx.array, mx.array, mx.array]:
+        """Fused decode with GQA via per-KV-head-group loop."""
+        all_acc = []
+        all_m = []
+        all_l = []
+
+        for kv_h in range(n_kv_heads):
+            # Slice this KV head's compressed key data
+            mse_h = kc.mse_indices[:, kv_h, :, :]       # (B, N, packed_d)
+            signs_h = kc.qjl_signs[:, kv_h, :, :]       # (B, N, packed_d_signs)
+            norms_h = kc.norms[:, kv_h, :]               # (B, N)
+            res_h = kc.residual_norms[:, kv_h, :]        # (B, N)
+
+            # Slice this KV head's compressed value data
+            vd_h = vc.data[:, kv_h, :, :]    # (B, N, packed_v)
+            vs_h = vc.scales[:, kv_h, :, :]   # (B, N, n_groups)
+            vz_h = vc.zeros[:, kv_h, :, :]    # (B, N, n_groups)
+
+            # Tile along batch dim for `repeats` query heads
+            mse_tiled = mx.repeat(mse_h, repeats, axis=0)
+            signs_tiled = mx.repeat(signs_h, repeats, axis=0)
+            norms_tiled = mx.repeat(norms_h, repeats, axis=0)
+            res_tiled = mx.repeat(res_h, repeats, axis=0)
+            vd_tiled = mx.repeat(vd_h, repeats, axis=0)
+            vs_tiled = mx.repeat(vs_h, repeats, axis=0)
+            vz_tiled = mx.repeat(vz_h, repeats, axis=0)
+
+            # Query heads for this KV group
+            q_start = kv_h * repeats
+            q_end = q_start + repeats
+            q_group = queries[:, q_start:q_end, 0, :]  # (B, repeats, D)
+            q_group_flat = q_group.reshape(B * repeats, D)
+
+            # Compute rotated/sketched for this query group
+            qr = mx.matmul(q_group_flat.astype(mx.float32), mx.transpose(Pi))
+            qs = mx.matmul(q_group_flat.astype(mx.float32), mx.transpose(S))
+
+            acc_h, m_h, l_h = kernel_fn(
+                q_rot=qr, q_sketch=qs,
+                mse=mse_tiled, signs=signs_tiled,
+                norms=norms_tiled, res_norms=res_tiled,
+                centroids=centroids,
+                v_data=vd_tiled, v_scales=vs_tiled, v_zeros=vz_tiled,
+                mse_bits=mse_bits, v_bits=self.value_bits,
+                D=D, group_size=self.value_group_size,
+                qjl_scale=qjl_scale, sm_scale=sm_scale,
+            )
+            # (B*repeats, D) -> (B, repeats, D)
+            all_acc.append(acc_h.reshape(B, repeats, D))
+            all_m.append(m_h.reshape(B, repeats))
+            all_l.append(l_h.reshape(B, repeats))
+
+        # Concatenate across KV head groups -> (B, n_heads, D), (B, n_heads), (B, n_heads)
+        acc = mx.concatenate(all_acc, axis=1).reshape(B * (n_kv_heads * repeats), D)
+        m = mx.concatenate(all_m, axis=1).reshape(B * (n_kv_heads * repeats))
+        l = mx.concatenate(all_l, axis=1).reshape(B * (n_kv_heads * repeats))
+        return acc, m, l
+
     # ---- Phase 2: Direct attention from compressed data ----
 
     def compute_compressed_scores(

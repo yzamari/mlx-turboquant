@@ -124,6 +124,87 @@ def _apply_mask(all_scores, mask, compressed_scores, buffer_scores, cache, n_q):
         return all_scores + mask
 
 
+def _turboquant_attention_fused(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    cache: TurboQuantCache,
+    scale: float,
+    mask: Optional[mx.array],
+) -> mx.array:
+    """
+    Fully fused attention: scores + online softmax + value dequant in ONE GPU pass.
+
+    The compressed portion is handled by a single Metal kernel that loops over
+    all N compressed tokens, computing online softmax and accumulating dequantized
+    value contributions in GPU registers. Zero intermediate tensors.
+
+    The buffer portion is computed via standard matmul (small, fast), then the
+    two partial results are merged using log-sum-exp arithmetic.
+
+    Only supports decode (n_q=1).
+    """
+    B, n_heads, n_q, D = queries.shape
+    assert n_q == 1, "Fused decode only supports n_q=1"
+
+    # 1. Fused kernel on compressed data: returns unnormalized (acc_c, m_c, l_c)
+    fused_result = cache.compute_fused_attention(queries, scale=scale)
+
+    # 2. Buffer scores via standard matmul
+    n_kv_heads = keys.shape[1]
+    n_repeats = n_heads // n_kv_heads
+    if n_repeats > 1:
+        buf_keys = mx.repeat(keys, n_repeats, axis=1)
+        buf_values = mx.repeat(values, n_repeats, axis=1)
+    else:
+        buf_keys = keys
+        buf_values = values
+
+    # (B, H, 1, n_buf)
+    buffer_scores = (queries @ mx.transpose(buf_keys, (0, 1, 3, 2))) * scale
+
+    # Apply mask to buffer scores only (compressed tokens are always visible)
+    if mask is not None and not (isinstance(mask, str) and mask == "causal"):
+        if isinstance(mask, mx.array):
+            n_buf = buffer_scores.shape[-1]
+            if mask.dtype == mx.bool_:
+                if mask.shape[-1] >= n_buf:
+                    buf_mask = mask[..., -n_buf:]
+                    buffer_scores = mx.where(
+                        buf_mask, buffer_scores, mx.finfo(buffer_scores.dtype).min
+                    )
+            else:
+                if mask.shape[-1] >= n_buf:
+                    buf_mask = mask[..., -n_buf:]
+                    buffer_scores = buffer_scores + buf_mask
+
+    if fused_result is None:
+        # No compressed data: standard buffer-only path
+        attn_weights = mx.softmax(buffer_scores, axis=-1, precise=True)
+        return attn_weights @ buf_values
+
+    acc_c, m_c, l_c = fused_result  # (B, H, 1, D), (B, H, 1), (B, H, 1)
+
+    # 3. Compute buffer softmax stats
+    # m_b = max(buffer_scores), p_b = exp(scores - m_b), l_b = sum(p_b)
+    m_b = mx.max(buffer_scores, axis=-1)          # (B, H, 1)
+    p_b = mx.exp(buffer_scores - m_b[..., None])  # (B, H, 1, n_buf)
+    l_b = mx.sum(p_b, axis=-1)                    # (B, H, 1)
+    acc_b = p_b @ buf_values                       # (B, H, 1, D)
+
+    # 4. Merge using log-sum-exp
+    m_both = mx.maximum(m_c, m_b)                        # (B, H, 1)
+    scale_c = mx.exp(m_c - m_both)                       # (B, H, 1)
+    scale_b = mx.exp(m_b - m_both)                       # (B, H, 1)
+    l_both = l_c * scale_c + l_b * scale_b               # (B, H, 1)
+
+    # Normalize
+    acc_merged = (acc_c * scale_c[..., None] + acc_b * scale_b[..., None])  # (B, H, 1, D)
+    output = acc_merged / (l_both[..., None] + 1e-10)
+
+    return output
+
+
 def _turboquant_attention(
     queries: mx.array,
     keys: mx.array,
@@ -231,9 +312,16 @@ def _patch_attention():
         if (isinstance(cache, TurboQuantCache)
             and cache._keys_compressed is not None
             and n_q == 1):
-            return _turboquant_attention(
-                queries, keys, values, cache, scale, mask
-            )
+            # Prefer fully fused path (single GPU pass), fall back to
+            # Phase 3 two-kernel path if fused kernel fails
+            try:
+                return _turboquant_attention_fused(
+                    queries, keys, values, cache, scale, mask
+                )
+            except Exception:
+                return _turboquant_attention(
+                    queries, keys, values, cache, scale, mask
+                )
 
         # Default path: standard attention (used for prefill and non-TQ caches)
         # For TQ cache during prefill, keys/values are buffer-only, which is
