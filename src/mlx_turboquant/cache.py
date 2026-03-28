@@ -258,68 +258,129 @@ class TurboQuantCache(_BaseCache):
 
         # Handle GQA: n_heads (query) may differ from n_kv_heads (key)
         n_kv_heads = kc.mse_indices.shape[1]
+        n_compressed = kc.mse_indices.shape[2]
         repeats = n_heads // n_kv_heads
 
-        def _expand_kv_head(t, axis=1):
-            """Repeat KV head dimension to match query heads."""
-            if repeats == 1:
-                return t
-            return mx.repeat(t, repeats, axis=axis)
+        if repeats == 1:
+            # No GQA: flatten directly, no expansion needed
+            scores = self._score_keys_flat(
+                queries, kc, n_heads, n_compressed, n_q, B, D,
+                Pi, S, centroids, mse_bits, qjl_scale,
+                turboquant_attention_score_metal,
+            )
+        else:
+            # GQA: loop per KV head group to avoid repeats-x memory expansion.
+            # For each KV head, slice its compressed data, tile it for the
+            # `repeats` query heads via batch-dim repeat (one head at a time),
+            # run the Metal kernel, then discard the tiled copy.
+            # Peak memory: repeats * (1 head's data) instead of repeats * (all heads' data).
+            scores = self._score_keys_gqa(
+                queries, kc, n_kv_heads, repeats, n_compressed, n_q, B, D,
+                Pi, S, centroids, mse_bits, qjl_scale,
+                turboquant_attention_score_metal,
+            )
 
-        # Expand compressed data to match query head count
-        mse_packed = _expand_kv_head(kc.mse_indices)
-        qjl_signs = _expand_kv_head(kc.qjl_signs)
-        norms = _expand_kv_head(kc.norms, axis=-1)
-        res_norms = _expand_kv_head(kc.residual_norms, axis=-1)
+        return scores * scale
 
-        # Metal kernels operate on flat (BH, ...) tensors
-        n_compressed = mse_packed.shape[2]
-        mse_flat = mse_packed.reshape(B * n_heads, n_compressed, -1)
-        qjl_flat = qjl_signs.reshape(B * n_heads, n_compressed, -1)
-        norms_flat = norms.reshape(B * n_heads, n_compressed)
-        res_norms_flat = res_norms.reshape(B * n_heads, n_compressed)
+    def _score_keys_flat(
+        self, queries, kc, n_heads, n_compressed, n_q, B, D,
+        Pi, S, centroids, mse_bits, qjl_scale, kernel_fn,
+    ) -> mx.array:
+        """Score compressed keys when n_heads == n_kv_heads (no GQA)."""
+        mse_flat = kc.mse_indices.reshape(B * n_heads, n_compressed, -1)
+        qjl_flat = kc.qjl_signs.reshape(B * n_heads, n_compressed, -1)
+        norms_flat = kc.norms.reshape(B * n_heads, n_compressed)
+        res_norms_flat = kc.residual_norms.reshape(B * n_heads, n_compressed)
 
         if n_q == 1:
-            # Decode path: single query token, optimal for Metal kernels
             q_flat = queries.reshape(B * n_heads, D)
-
-            scores_flat = turboquant_attention_score_metal(
-                query=q_flat,
-                mse_packed=mse_flat,
-                qjl_signs=qjl_flat,
-                norms=norms_flat,
-                residual_norms=res_norms_flat,
-                Pi=Pi,
-                S=S,
-                centroids=centroids,
-                mse_bits=mse_bits,
-                qjl_scale=qjl_scale,
+            scores_flat = kernel_fn(
+                query=q_flat, mse_packed=mse_flat, qjl_signs=qjl_flat,
+                norms=norms_flat, residual_norms=res_norms_flat,
+                Pi=Pi, S=S, centroids=centroids,
+                mse_bits=mse_bits, qjl_scale=qjl_scale,
             )
-            # (BH, N) -> (B, n_heads, 1, N)
-            scores = scores_flat.reshape(B, n_heads, 1, n_compressed) * scale
+            return scores_flat.reshape(B, n_heads, 1, n_compressed)
         else:
-            # Prefill path: multiple query tokens -- loop over each
             all_scores = []
             for qi in range(n_q):
                 q_flat = queries[:, :, qi, :].reshape(B * n_heads, D)
-                s = turboquant_attention_score_metal(
-                    query=q_flat,
-                    mse_packed=mse_flat,
-                    qjl_signs=qjl_flat,
-                    norms=norms_flat,
-                    residual_norms=res_norms_flat,
-                    Pi=Pi,
-                    S=S,
-                    centroids=centroids,
-                    mse_bits=mse_bits,
-                    qjl_scale=qjl_scale,
+                s = kernel_fn(
+                    query=q_flat, mse_packed=mse_flat, qjl_signs=qjl_flat,
+                    norms=norms_flat, residual_norms=res_norms_flat,
+                    Pi=Pi, S=S, centroids=centroids,
+                    mse_bits=mse_bits, qjl_scale=qjl_scale,
                 )
                 all_scores.append(s)
-            # Stack: list of (BH, N) -> (BH, n_q, N) -> (B, H, n_q, N)
             scores_flat = mx.stack(all_scores, axis=1)
-            scores = scores_flat.reshape(B, n_heads, n_q, n_compressed) * scale
+            return scores_flat.reshape(B, n_heads, n_q, n_compressed)
 
-        return scores
+    def _score_keys_gqa(
+        self, queries, kc, n_kv_heads, repeats, n_compressed, n_q, B, D,
+        Pi, S, centroids, mse_bits, qjl_scale, kernel_fn,
+    ) -> mx.array:
+        """Score compressed keys with GQA via per-KV-head-group loop.
+
+        For each KV head, slices its compressed data and tiles it along the
+        batch dimension for the `repeats` query heads sharing that KV head.
+        Peak memory is repeats * (one head's data) instead of repeats * (all heads' data).
+        """
+        n_heads = n_kv_heads * repeats
+        all_group_scores = []
+
+        for kv_h in range(n_kv_heads):
+            # Slice this KV head's compressed data: (B, N, packed_d)
+            mse_h = kc.mse_indices[:, kv_h, :, :]       # (B, N, packed_d)
+            signs_h = kc.qjl_signs[:, kv_h, :, :]       # (B, N, packed_d_signs)
+            norms_h = kc.norms[:, kv_h, :]               # (B, N)
+            res_h = kc.residual_norms[:, kv_h, :]        # (B, N)
+
+            # Tile along batch dim for `repeats` query heads:
+            # (B, N, packed_d) -> (B*repeats, N, packed_d)
+            mse_tiled = mx.repeat(mse_h, repeats, axis=0)
+            signs_tiled = mx.repeat(signs_h, repeats, axis=0)
+            norms_tiled = mx.repeat(norms_h, repeats, axis=0)
+            res_tiled = mx.repeat(res_h, repeats, axis=0)
+
+            # Query heads for this KV group: (B, repeats, n_q, D)
+            q_start = kv_h * repeats
+            q_end = q_start + repeats
+            q_group = queries[:, q_start:q_end, :, :]
+
+            if n_q == 1:
+                # (B, repeats, 1, D) -> (B*repeats, D)
+                q_flat = q_group.reshape(B * repeats, D)
+                scores_h = kernel_fn(
+                    query=q_flat, mse_packed=mse_tiled, qjl_signs=signs_tiled,
+                    norms=norms_tiled, residual_norms=res_tiled,
+                    Pi=Pi, S=S, centroids=centroids,
+                    mse_bits=mse_bits, qjl_scale=qjl_scale,
+                )
+                # (B*repeats, N) -> (B, repeats, N)
+                all_group_scores.append(scores_h.reshape(B, repeats, n_compressed))
+            else:
+                # Prefill: loop over query positions within this group
+                qi_scores = []
+                for qi in range(n_q):
+                    q_flat = q_group[:, :, qi, :].reshape(B * repeats, D)
+                    s = kernel_fn(
+                        query=q_flat, mse_packed=mse_tiled, qjl_signs=signs_tiled,
+                        norms=norms_tiled, residual_norms=res_tiled,
+                        Pi=Pi, S=S, centroids=centroids,
+                        mse_bits=mse_bits, qjl_scale=qjl_scale,
+                    )
+                    qi_scores.append(s)
+                # list of (B*repeats, N) -> (B*repeats, n_q, N) -> (B, repeats, n_q, N)
+                stacked = mx.stack(qi_scores, axis=1)
+                all_group_scores.append(stacked.reshape(B, repeats, n_q, n_compressed))
+
+        if n_q == 1:
+            # list of (B, repeats, N) -> (B, n_heads, N) -> (B, n_heads, 1, N)
+            scores = mx.concatenate(all_group_scores, axis=1)
+            return scores.reshape(B, n_heads, 1, n_compressed)
+        else:
+            # list of (B, repeats, n_q, N) -> (B, n_heads, n_q, N)
+            return mx.concatenate(all_group_scores, axis=1)
 
     def get_decompressed_values(self) -> mx.array | None:
         """
@@ -366,63 +427,121 @@ class TurboQuantCache(_BaseCache):
         B, n_heads, n_q, n_compressed = weights.shape
         D = self.head_dim
 
-        # Handle GQA: expand compressed values heads to match query heads
+        # Handle GQA: n_heads (query/weight) may differ from n_kv_heads (value)
         n_kv_heads = vc.data.shape[1]
         repeats = n_heads // n_kv_heads
 
-        def _expand_kv_head(t, axis=1):
-            if repeats == 1:
-                return t
-            return mx.repeat(t, repeats, axis=axis)
+        if repeats == 1:
+            # No GQA: flatten directly, no expansion needed
+            return self._value_output_flat(
+                weights, vc, n_heads, n_q, n_compressed, B, D,
+                turboquant_value_weighted_sum_metal,
+            )
+        else:
+            # GQA: loop per KV head group to avoid repeats-x memory expansion
+            return self._value_output_gqa(
+                weights, vc, n_kv_heads, repeats, n_q, n_compressed, B, D,
+                turboquant_value_weighted_sum_metal,
+            )
 
-        val_data = _expand_kv_head(vc.data)       # (B, n_heads, N, packed_d)
-        val_scales = _expand_kv_head(vc.scales)    # (B, n_heads, N, n_groups)
-        val_zeros = _expand_kv_head(vc.zeros)      # (B, n_heads, N, n_groups)
+    def _value_output_flat(
+        self, weights, vc, n_heads, n_q, n_compressed, B, D, kernel_fn,
+    ) -> mx.array:
+        """Compute value weighted sum when n_heads == n_kv_heads (no GQA)."""
+        vd_flat = vc.data.reshape(B * n_heads, n_compressed, -1)
+        vs_flat = vc.scales.reshape(B * n_heads, n_compressed, -1)
+        vz_flat = vc.zeros.reshape(B * n_heads, n_compressed, -1)
 
         if n_q == 1:
-            # Decode path: single query, optimal
-            # Flatten batch and heads: (B*H, N_compressed)
             w_flat = weights.reshape(B * n_heads, n_compressed)
-            vd_flat = val_data.reshape(B * n_heads, n_compressed, -1)
-            vs_flat = val_scales.reshape(B * n_heads, n_compressed, -1)
-            vz_flat = val_zeros.reshape(B * n_heads, n_compressed, -1)
-
-            # Fused Metal kernel: (B*H, D)
-            out_flat = turboquant_value_weighted_sum_metal(
-                weights=w_flat,
-                packed_values=vd_flat,
-                scales=vs_flat,
-                zeros=vz_flat,
+            out_flat = kernel_fn(
+                weights=w_flat, packed_values=vd_flat,
+                scales=vs_flat, zeros=vz_flat,
                 value_bits=self.value_bits,
                 group_size=self.value_group_size,
                 head_dim=D,
             )
-            # (B*H, D) -> (B, n_heads, 1, D)
             return out_flat.reshape(B, n_heads, 1, D)
         else:
-            # Prefill path: loop over query positions
             all_outputs = []
             for qi in range(n_q):
-                w_qi = weights[:, :, qi, :]  # (B, n_heads, n_compressed)
-                w_flat = w_qi.reshape(B * n_heads, n_compressed)
-                vd_flat = val_data.reshape(B * n_heads, n_compressed, -1)
-                vs_flat = val_scales.reshape(B * n_heads, n_compressed, -1)
-                vz_flat = val_zeros.reshape(B * n_heads, n_compressed, -1)
-
-                out_flat = turboquant_value_weighted_sum_metal(
-                    weights=w_flat,
-                    packed_values=vd_flat,
-                    scales=vs_flat,
-                    zeros=vz_flat,
+                w_flat = weights[:, :, qi, :].reshape(B * n_heads, n_compressed)
+                out_flat = kernel_fn(
+                    weights=w_flat, packed_values=vd_flat,
+                    scales=vs_flat, zeros=vz_flat,
                     value_bits=self.value_bits,
                     group_size=self.value_group_size,
                     head_dim=D,
                 )
                 all_outputs.append(out_flat)
-
-            # Stack: list of (B*H, D) -> (B*H, n_q, D) -> (B, H, n_q, D)
             stacked = mx.stack(all_outputs, axis=1)
             return stacked.reshape(B, n_heads, n_q, D)
+
+    def _value_output_gqa(
+        self, weights, vc, n_kv_heads, repeats, n_q, n_compressed, B, D,
+        kernel_fn,
+    ) -> mx.array:
+        """Compute value weighted sum with GQA via per-KV-head-group loop.
+
+        For each KV head, slices its compressed value data and tiles it along
+        the batch dimension for the `repeats` query heads sharing that KV head.
+        Peak memory: repeats * (one head's data) instead of repeats * (all heads' data).
+        """
+        n_heads = n_kv_heads * repeats
+        all_group_outputs = []
+
+        for kv_h in range(n_kv_heads):
+            # Slice this KV head's value data: (B, N, packed_d) etc.
+            vd_h = vc.data[:, kv_h, :, :]    # (B, N, packed_d)
+            vs_h = vc.scales[:, kv_h, :, :]   # (B, N, n_groups)
+            vz_h = vc.zeros[:, kv_h, :, :]    # (B, N, n_groups)
+
+            # Tile along batch dim for `repeats` query heads:
+            # (B, N, packed_d) -> (B*repeats, N, packed_d)
+            vd_tiled = mx.repeat(vd_h, repeats, axis=0)
+            vs_tiled = mx.repeat(vs_h, repeats, axis=0)
+            vz_tiled = mx.repeat(vz_h, repeats, axis=0)
+
+            # Weights for this group's query heads: (B, repeats, n_q, N)
+            q_start = kv_h * repeats
+            q_end = q_start + repeats
+            w_group = weights[:, q_start:q_end, :, :]
+
+            if n_q == 1:
+                # (B, repeats, 1, N) -> (B*repeats, N)
+                w_flat = w_group.reshape(B * repeats, n_compressed)
+                out_h = kernel_fn(
+                    weights=w_flat, packed_values=vd_tiled,
+                    scales=vs_tiled, zeros=vz_tiled,
+                    value_bits=self.value_bits,
+                    group_size=self.value_group_size,
+                    head_dim=D,
+                )
+                # (B*repeats, D) -> (B, repeats, D)
+                all_group_outputs.append(out_h.reshape(B, repeats, D))
+            else:
+                qi_outputs = []
+                for qi in range(n_q):
+                    w_flat = w_group[:, :, qi, :].reshape(B * repeats, n_compressed)
+                    out_qi = kernel_fn(
+                        weights=w_flat, packed_values=vd_tiled,
+                        scales=vs_tiled, zeros=vz_tiled,
+                        value_bits=self.value_bits,
+                        group_size=self.value_group_size,
+                        head_dim=D,
+                    )
+                    qi_outputs.append(out_qi)
+                # list of (B*repeats, D) -> (B*repeats, n_q, D) -> (B, repeats, n_q, D)
+                stacked = mx.stack(qi_outputs, axis=1)
+                all_group_outputs.append(stacked.reshape(B, repeats, n_q, D))
+
+        if n_q == 1:
+            # list of (B, repeats, D) -> (B, n_heads, D) -> (B, n_heads, 1, D)
+            output = mx.concatenate(all_group_outputs, axis=1)
+            return output.reshape(B, n_heads, 1, D)
+        else:
+            # list of (B, repeats, n_q, D) -> (B, n_heads, n_q, D)
+            return mx.concatenate(all_group_outputs, axis=1)
 
     # ---- _BaseCache interface ----
 

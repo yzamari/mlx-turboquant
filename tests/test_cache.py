@@ -537,3 +537,199 @@ class TestDirectAttention:
         assert diff < 0.5, (
             f"Phase 2 output should approximate legacy, got mean diff={diff}"
         )
+
+
+class TestGQA:
+    """Test GQA (Grouped Query Attention) support.
+
+    In GQA, n_query_heads > n_kv_heads. For example, Qwen2.5-32B uses
+    n_kv_heads=8, n_query_heads=40 (repeats=5). The per-KV-head-group
+    loop must produce correct results without expanding all compressed
+    data at once.
+
+    NOTE: Compression only happens during decode (n_new=1), not prefill.
+    Tests that need compressed data must feed tokens one-at-a-time to
+    trigger the flush_batch_size threshold.
+    """
+
+    N_KV_HEADS = 2
+    N_QUERY_HEADS = 8  # repeats = 4
+
+    def _make_gqa_cache(self, buffer_size=16):
+        return _make_cache(buffer_size=buffer_size)
+
+    def _random_kv_gqa(self, seq_len, batch=BATCH, head_dim=HEAD_DIM):
+        """Generate KV with n_kv_heads, queries with n_query_heads."""
+        keys = mx.random.normal((batch, self.N_KV_HEADS, seq_len, head_dim))
+        values = mx.random.normal((batch, self.N_KV_HEADS, seq_len, head_dim))
+        mx.eval(keys, values)
+        return keys, values
+
+    def _random_queries_gqa(self, n_q=1, batch=BATCH, head_dim=HEAD_DIM):
+        queries = mx.random.normal((batch, self.N_QUERY_HEADS, n_q, head_dim))
+        mx.eval(queries)
+        return queries
+
+    def _fill_cache_with_compressed(self, cache, n_total=64):
+        """Fill cache by feeding tokens one-at-a-time to trigger decode flush.
+
+        Feeds n_total single tokens (n_new=1), which triggers flush when
+        buffer exceeds buffer_size + flush_batch_size.
+        """
+        for _ in range(n_total):
+            k, v = self._random_kv_gqa(1)
+            buf_k, buf_v = cache.update_and_fetch(k, v)
+            mx.eval(buf_k, buf_v)
+        assert cache._keys_compressed is not None, (
+            f"Expected compressed data after {n_total} decode steps, "
+            f"buffer_size={cache.buffer_size}, flush_batch={cache.flush_batch_size}"
+        )
+        return buf_k, buf_v
+
+    def test_compressed_scores_shape_gqa_decode(self):
+        """Compressed scores have correct shape with GQA during decode."""
+        cache = self._make_gqa_cache(buffer_size=16)
+        self._fill_cache_with_compressed(cache, n_total=64)
+
+        queries = self._random_queries_gqa(n_q=1)
+        scores = cache.compute_compressed_scores(queries, scale=1.0)
+        mx.eval(scores)
+
+        assert scores is not None
+        n_compressed = cache.compressed_tokens
+        assert scores.shape == (BATCH, self.N_QUERY_HEADS, 1, n_compressed), (
+            f"Expected (1, {self.N_QUERY_HEADS}, 1, {n_compressed}), got {scores.shape}"
+        )
+
+    def test_compressed_scores_shape_gqa_prefill(self):
+        """Compressed scores have correct shape with GQA during prefill (n_q > 1)."""
+        cache = self._make_gqa_cache(buffer_size=16)
+        self._fill_cache_with_compressed(cache, n_total=64)
+
+        n_q = 4
+        queries = self._random_queries_gqa(n_q=n_q)
+        scores = cache.compute_compressed_scores(queries, scale=1.0)
+        mx.eval(scores)
+
+        assert scores is not None
+        n_compressed = cache.compressed_tokens
+        assert scores.shape == (BATCH, self.N_QUERY_HEADS, n_q, n_compressed)
+
+    def test_compressed_scores_gqa_vs_decompressed_matmul(self):
+        """GQA compressed scores should approximate decompressed key matmul."""
+        cache = self._make_gqa_cache(buffer_size=16)
+        self._fill_cache_with_compressed(cache, n_total=64)
+
+        queries = self._random_queries_gqa(n_q=1)
+        mx.eval(queries)
+
+        # Metal kernel path (GQA per-group loop)
+        compressed_scores = cache.compute_compressed_scores(queries, scale=1.0)
+        mx.eval(compressed_scores)
+
+        # Reference: decompress keys, expand for GQA, matmul
+        decompressed_keys = cache.key_quantizer.dequantize(cache._keys_compressed)
+        mx.eval(decompressed_keys)
+        # Expand KV heads to match query heads
+        repeats = self.N_QUERY_HEADS // self.N_KV_HEADS
+        expanded_keys = mx.repeat(decompressed_keys, repeats, axis=1)
+        reference_scores = queries @ mx.transpose(expanded_keys, (0, 1, 3, 2))
+        mx.eval(reference_scores)
+
+        diff = float(mx.mean(mx.abs(compressed_scores - reference_scores)))
+        assert diff < 0.5, (
+            f"GQA Metal kernel scores should match decompressed matmul, "
+            f"got mean diff={diff}"
+        )
+
+    def test_value_output_gqa_shape_decode(self):
+        """Value weighted sum has correct shape with GQA during decode."""
+        cache = self._make_gqa_cache(buffer_size=16)
+        self._fill_cache_with_compressed(cache, n_total=64)
+
+        n_compressed = cache.compressed_tokens
+        # Fake weights: (B, n_query_heads, 1, n_compressed)
+        weights = mx.softmax(
+            mx.random.normal((BATCH, self.N_QUERY_HEADS, 1, n_compressed)),
+            axis=-1,
+        )
+        mx.eval(weights)
+
+        output = cache.compute_compressed_value_output(weights)
+        mx.eval(output)
+
+        assert output is not None
+        assert output.shape == (BATCH, self.N_QUERY_HEADS, 1, HEAD_DIM), (
+            f"Expected (1, {self.N_QUERY_HEADS}, 1, {HEAD_DIM}), got {output.shape}"
+        )
+        assert not mx.any(mx.isnan(output)).item()
+
+    def test_value_output_gqa_shape_prefill(self):
+        """Value weighted sum has correct shape with GQA during prefill."""
+        cache = self._make_gqa_cache(buffer_size=16)
+        self._fill_cache_with_compressed(cache, n_total=64)
+
+        n_compressed = cache.compressed_tokens
+        n_q = 4
+        weights = mx.softmax(
+            mx.random.normal((BATCH, self.N_QUERY_HEADS, n_q, n_compressed)),
+            axis=-1,
+        )
+        mx.eval(weights)
+
+        output = cache.compute_compressed_value_output(weights)
+        mx.eval(output)
+
+        assert output is not None
+        assert output.shape == (BATCH, self.N_QUERY_HEADS, n_q, HEAD_DIM)
+        assert not mx.any(mx.isnan(output)).item()
+
+    def test_full_attention_gqa_decode(self):
+        """Full attention path works with GQA during decode."""
+        from mlx_turboquant.patch import _turboquant_attention
+
+        cache = self._make_gqa_cache(buffer_size=16)
+        buf_k, buf_v = self._fill_cache_with_compressed(cache, n_total=64)
+
+        queries = self._random_queries_gqa(n_q=1)
+        scale = 1.0 / math.sqrt(HEAD_DIM)
+        output = _turboquant_attention(
+            queries, buf_k, buf_v, cache, scale, mask=None
+        )
+        mx.eval(output)
+
+        assert output.shape == (BATCH, self.N_QUERY_HEADS, 1, HEAD_DIM)
+        assert not mx.any(mx.isnan(output)).item()
+
+    def test_full_attention_gqa_vs_legacy(self):
+        """GQA attention output should approximate legacy decompression path."""
+        from mlx_turboquant.patch import _turboquant_attention
+
+        cache = self._make_gqa_cache(buffer_size=16)
+        buf_k, buf_v = self._fill_cache_with_compressed(cache, n_total=64)
+
+        queries = self._random_queries_gqa(n_q=1)
+        scale = 1.0 / math.sqrt(HEAD_DIM)
+
+        # Phase 2: GQA per-group loop path
+        output_ph2 = _turboquant_attention(
+            queries, buf_k, buf_v, cache, scale, mask=None
+        )
+        mx.eval(output_ph2)
+
+        # Legacy: full decompression + GQA expansion
+        all_keys = cache._get_all_keys()
+        all_values = cache._get_all_values()
+        mx.eval(all_keys, all_values)
+        repeats = self.N_QUERY_HEADS // self.N_KV_HEADS
+        exp_keys = mx.repeat(all_keys, repeats, axis=1)
+        exp_values = mx.repeat(all_values, repeats, axis=1)
+        legacy_scores = (queries @ mx.transpose(exp_keys, (0, 1, 3, 2))) * scale
+        legacy_weights = mx.softmax(legacy_scores, axis=-1, precise=True)
+        output_legacy = legacy_weights @ exp_values
+        mx.eval(output_legacy)
+
+        diff = float(mx.mean(mx.abs(output_ph2 - output_legacy)))
+        assert diff < 0.5, (
+            f"GQA Phase 2 output should approximate legacy, got mean diff={diff}"
+        )
