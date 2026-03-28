@@ -127,9 +127,31 @@ class TurboQuantCache(_BaseCache):
         return self._key_buffer, self._value_buffer
 
     def _flush(self):
-        """Compress oldest buffer tokens into quantized storage."""
+        """Compress oldest buffer tokens into quantized storage.
+
+        When n_flush is large (e.g., 16K tokens after prefill), compresses in
+        chunks of flush_batch_size to avoid a memory spike from creating massive
+        temporary arrays (rotation matmul, QJL projection) all at once.
+        """
         n_flush = self._key_buffer.shape[2] - self.buffer_size
         if n_flush <= 0:
+            return
+
+        # Chunked flush: compress flush_batch_size tokens at a time to keep
+        # peak memory low. Without this, compressing 16K tokens at once creates
+        # (16K, 128) @ (128, 128) temporaries that spike peak memory by ~7 GB.
+        chunk_size = self.flush_batch_size
+        if n_flush > chunk_size:
+            keys_to_flush = self._key_buffer[:, :, :n_flush, :]
+            values_to_flush = self._value_buffer[:, :, :n_flush, :]
+            self._key_buffer = self._key_buffer[:, :, n_flush:, :]
+            self._value_buffer = self._value_buffer[:, :, n_flush:, :]
+
+            for start in range(0, n_flush, chunk_size):
+                end = min(start + chunk_size, n_flush)
+                k_chunk = keys_to_flush[:, :, start:end, :]
+                v_chunk = values_to_flush[:, :, start:end, :]
+                self._compress_and_store(k_chunk, v_chunk)
             return
 
         keys_to_compress = self._key_buffer[:, :, :n_flush, :]
@@ -137,12 +159,13 @@ class TurboQuantCache(_BaseCache):
         self._key_buffer = self._key_buffer[:, :, n_flush:, :]
         self._value_buffer = self._value_buffer[:, :, n_flush:, :]
 
-        # Compress keys with TurboQuant product quantization
-        new_key_q = self.key_quantizer.quantize(keys_to_compress)
+        self._compress_and_store(keys_to_compress, values_to_compress)
 
-        # Compress values with group quantization
+    def _compress_and_store(self, keys, values):
+        """Quantize keys+values and append to compressed storage."""
+        new_key_q = self.key_quantizer.quantize(keys)
         new_val_q = quantize_values(
-            values_to_compress,
+            values,
             bits=self.value_bits,
             group_size=self.value_group_size,
             backend="mlx",
@@ -152,7 +175,6 @@ class TurboQuantCache(_BaseCache):
             self._keys_compressed = new_key_q
             self._values_compressed = new_val_q
         else:
-            # Concatenate compressed storage along sequence dimension
             self._keys_compressed = ProdQuantized(
                 mse_indices=mx.concatenate(
                     [self._keys_compressed.mse_indices, new_key_q.mse_indices],
@@ -163,10 +185,7 @@ class TurboQuantCache(_BaseCache):
                     axis=-2,
                 ),
                 residual_norms=mx.concatenate(
-                    [
-                        self._keys_compressed.residual_norms,
-                        new_key_q.residual_norms,
-                    ],
+                    [self._keys_compressed.residual_norms, new_key_q.residual_norms],
                     axis=-1,
                 ),
                 norms=mx.concatenate(
@@ -180,12 +199,10 @@ class TurboQuantCache(_BaseCache):
                     [self._values_compressed.data, new_val_q.data], axis=-2
                 ),
                 scales=mx.concatenate(
-                    [self._values_compressed.scales, new_val_q.scales],
-                    axis=-2,
+                    [self._values_compressed.scales, new_val_q.scales], axis=-2
                 ),
                 zeros=mx.concatenate(
-                    [self._values_compressed.zeros, new_val_q.zeros],
-                    axis=-2,
+                    [self._values_compressed.zeros, new_val_q.zeros], axis=-2
                 ),
                 bits=self.value_bits,
             )
