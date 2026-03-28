@@ -2,7 +2,20 @@
 
 TurboQuant KV cache compression for MLX-LM inference on Apple Silicon. **Faster than standard inference on medium and long contexts, with 100% output quality.**
 
-## Benchmark Results (M4 Pro 48GB, Qwen2.5-3B-Instruct-4bit)
+## Benchmark Results (M4 Pro 48GB)
+
+### Qwen2.5-32B-Instruct-4bit
+
+| Context | Standard (FP16 cache) | TurboQuant (3-bit) | Speed | Quality |
+|---------|----------------------|-------------------|-------|---------|
+| Short (36 tok) | 6.7 tok/s | 6.8 tok/s | 101% | 100% match |
+| Medium (690 tok) | 7.0 tok/s | 7.2 tok/s | 103% | 100% match |
+| Long (1130 tok) | 6.9 tok/s | **9.6 tok/s** | **139%** | 100% match |
+| Long gen (500 tok) | 6.9 tok/s | 6.7 tok/s | 97% | 100% match |
+
+**39% faster on long context** with the 32B model. Larger models are more memory-bandwidth-constrained, so TurboQuant's compressed KV cache gives a bigger advantage.
+
+### Qwen2.5-3B-Instruct-4bit
 
 | Context | Standard (FP16 cache) | TurboQuant (3-bit) | Speed | Quality |
 |---------|----------------------|-------------------|-------|---------|
