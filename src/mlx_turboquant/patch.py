@@ -287,6 +287,48 @@ def _turboquant_attention(
     return output
 
 
+_PREFILL_CHUNK_SIZE = 256
+
+
+def _turboquant_attention_chunked_prefill(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    cache: TurboQuantCache,
+    scale: float,
+    mask: Optional[mx.array],
+) -> mx.array:
+    """
+    Handle prefill with compressed data by chunking queries.
+
+    Without chunking, the two-kernel path materializes a (B, H, qL, N_total)
+    score matrix which is huge for long prefills (e.g. 16K × 16K × 40 heads).
+    Chunking limits this to (B, H, chunk_size, N_total) per iteration.
+    """
+    n_q = queries.shape[2]
+    if n_q <= _PREFILL_CHUNK_SIZE:
+        return _turboquant_attention(queries, keys, values, cache, scale, mask)
+
+    outputs = []
+    for q_start in range(0, n_q, _PREFILL_CHUNK_SIZE):
+        q_end = min(q_start + _PREFILL_CHUNK_SIZE, n_q)
+        q_chunk = queries[:, :, q_start:q_end, :]
+
+        # Slice mask for this query chunk if applicable
+        mask_chunk = mask
+        if isinstance(mask, mx.array) and mask.ndim >= 3:
+            if mask.shape[-2] > 1:
+                mask_chunk = mask[..., q_start:q_end, :]
+
+        out_chunk = _turboquant_attention(
+            q_chunk, keys, values, cache, scale, mask_chunk
+        )
+        outputs.append(out_chunk)
+        mx.eval(out_chunk)  # Release score matrix intermediates
+
+    return mx.concatenate(outputs, axis=2)
+
+
 def _patch_attention():
     """
     Monkey-patch mlx_lm's scaled_dot_product_attention to detect
@@ -323,15 +365,12 @@ def _patch_attention():
                     queries, keys, values, cache, scale, mask
                 )
 
-        # Default path: standard attention (used for prefill and non-TQ caches)
-        # For TQ cache during prefill, keys/values are buffer-only, which is
-        # fine because during prefill all tokens are in the buffer before flush.
+        # Prefill with compressed data: use two-kernel path (zero decompression)
+        # Metal kernels already support qL > 1 by looping over query positions.
+        # Chunk queries to limit score matrix size (qL × N_total per head).
         if isinstance(cache, TurboQuantCache) and cache._keys_compressed is not None and n_q > 1:
-            # Prefill with compressed data: decompress and use standard path
-            all_keys = cache._get_all_keys()
-            all_values = cache._get_all_values()
-            return original_sdpa(
-                queries, all_keys, all_values, cache=None, scale=scale, mask=mask, sinks=sinks,
+            return _turboquant_attention_chunked_prefill(
+                queries, keys, values, cache, scale, mask
             )
 
         return original_sdpa(

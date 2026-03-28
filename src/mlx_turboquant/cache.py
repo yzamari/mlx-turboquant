@@ -146,12 +146,18 @@ class TurboQuantCache(_BaseCache):
             values_to_flush = self._value_buffer[:, :, :n_flush, :]
             self._key_buffer = self._key_buffer[:, :, n_flush:, :]
             self._value_buffer = self._value_buffer[:, :, n_flush:, :]
+            # Force buffer slice evaluation before iterating
+            mx.eval(self._key_buffer, self._value_buffer)
 
             for start in range(0, n_flush, chunk_size):
                 end = min(start + chunk_size, n_flush)
                 k_chunk = keys_to_flush[:, :, start:end, :]
                 v_chunk = values_to_flush[:, :, start:end, :]
                 self._compress_and_store(k_chunk, v_chunk)
+                # Force evaluation to release this chunk's compression
+                # intermediates before the next chunk starts. Without this,
+                # lazy eval keeps ALL chunks' intermediates alive at once.
+                self._eval_compressed()
             return
 
         keys_to_compress = self._key_buffer[:, :, :n_flush, :]
@@ -160,6 +166,20 @@ class TurboQuantCache(_BaseCache):
         self._value_buffer = self._value_buffer[:, :, n_flush:, :]
 
         self._compress_and_store(keys_to_compress, values_to_compress)
+        self._eval_compressed()
+
+    def _eval_compressed(self):
+        """Force evaluation of compressed arrays to release intermediates."""
+        if self._keys_compressed is not None:
+            mx.eval(
+                self._keys_compressed.mse_indices,
+                self._keys_compressed.qjl_signs,
+                self._keys_compressed.norms,
+                self._keys_compressed.residual_norms,
+                self._values_compressed.data,
+                self._values_compressed.scales,
+                self._values_compressed.zeros,
+            )
 
     def _compress_and_store(self, keys, values):
         """Quantize keys+values and append to compressed storage."""
