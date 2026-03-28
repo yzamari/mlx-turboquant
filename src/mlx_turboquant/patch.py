@@ -310,9 +310,15 @@ def _turboquant_attention_chunked_prefill(
         return _turboquant_attention(queries, keys, values, cache, scale, mask)
 
     outputs = []
+    original_offset = cache.offset
     for q_start in range(0, n_q, _PREFILL_CHUNK_SIZE):
         q_end = min(q_start + _PREFILL_CHUNK_SIZE, n_q)
         q_chunk = queries[:, :, q_start:q_end, :]
+
+        # Temporarily adjust cache.offset so _apply_mask computes correct
+        # causal mask positions for this chunk. Without this, all chunks
+        # would use the same (wrong) offset.
+        cache.offset = original_offset - n_q + q_end
 
         # Slice mask for this query chunk if applicable
         mask_chunk = mask
@@ -326,6 +332,7 @@ def _turboquant_attention_chunked_prefill(
         outputs.append(out_chunk)
         mx.eval(out_chunk)  # Release score matrix intermediates
 
+    cache.offset = original_offset  # Restore
     return mx.concatenate(outputs, axis=2)
 
 

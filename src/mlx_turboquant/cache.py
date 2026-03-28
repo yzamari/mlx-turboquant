@@ -146,8 +146,13 @@ class TurboQuantCache(_BaseCache):
             values_to_flush = self._value_buffer[:, :, :n_flush, :]
             self._key_buffer = self._key_buffer[:, :, n_flush:, :]
             self._value_buffer = self._value_buffer[:, :, n_flush:, :]
-            # Force buffer slice evaluation before iterating
-            mx.eval(self._key_buffer, self._value_buffer)
+            # Force evaluation of ALL slices so the original buffer can be freed.
+            # Without this, keys_to_flush holds a lazy view keeping the full
+            # pre-flush buffer alive for the entire loop.
+            mx.eval(
+                keys_to_flush, values_to_flush,
+                self._key_buffer, self._value_buffer,
+            )
 
             for start in range(0, n_flush, chunk_size):
                 end = min(start + chunk_size, n_flush)
