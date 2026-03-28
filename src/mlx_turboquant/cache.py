@@ -260,8 +260,6 @@ class TurboQuantCache(_BaseCache):
         if self._keys_compressed is None or self._values_compressed is None:
             return None
 
-        from mlx_turboquant.metal.fused_decode import turboquant_fused_decode_metal
-
         B, n_heads, n_q, D = queries.shape
         kc = self._keys_compressed
         vc = self._values_compressed
@@ -270,39 +268,30 @@ class TurboQuantCache(_BaseCache):
         Pi = self.key_quantizer.mse_quantizer.Pi
         S = self.key_quantizer.S
         centroids = self.key_quantizer.mse_quantizer.centroids
-        mse_bits = self.key_bits  # e.g. 3 -> MSE uses 2 bits internally
+        mse_eff_bits = self.key_bits - 1  # TurboQuantProd uses bits-1 for MSE
         qjl_scale = self.key_quantizer.qjl_scale
 
-        # Precompute rotated and sketched queries (once)
-        q_flat = queries.reshape(B * n_heads, D)
-        q_rot = mx.matmul(q_flat.astype(mx.float32), mx.transpose(Pi))    # (BH, D)
-        q_sketch = mx.matmul(q_flat.astype(mx.float32), mx.transpose(S))  # (BH, D)
-
-        # Handle GQA: n_heads (query) may differ from n_kv_heads (key)
-        n_kv_heads = kc.mse_indices.shape[1]
-        n_compressed = kc.mse_indices.shape[2]
-        repeats = n_heads // n_kv_heads
-
-        if repeats == 1:
-            # No GQA: flatten directly
-            acc, m, l = self._fused_flat(
-                q_rot, q_sketch, kc, vc, n_heads, n_compressed, B, D,
-                centroids, mse_bits, qjl_scale, scale,
-                turboquant_fused_decode_metal,
-            )
-        else:
-            # GQA: loop per KV head group
-            acc, m, l = self._fused_gqa(
-                q_rot, q_sketch, queries, kc, vc,
-                n_kv_heads, repeats, n_compressed, B, D,
-                Pi, S, centroids, mse_bits, qjl_scale, scale,
-                turboquant_fused_decode_metal,
-            )
-
-        # Reshape to (B, n_heads, 1, D), (B, n_heads, 1), (B, n_heads, 1)
-        acc = acc.reshape(B, n_heads, 1, D)
-        m = m.reshape(B, n_heads, 1)
-        l = l.reshape(B, n_heads, 1)
+        # Use native C++/Metal kernel — handles GQA and query rotation internally
+        # Input shapes: queries (B, H_q, 1, D), kc.mse_indices (B, H_kv, N, packed_d)
+        acc, m, l = mx.fast.turboquant_attention(
+            queries,
+            kc.mse_indices,       # (B, H_kv, N, packed_d_mse) uint8
+            kc.qjl_signs,         # (B, H_kv, N, packed_d_signs) uint8
+            kc.norms,             # (B, H_kv, N)
+            kc.residual_norms,    # (B, H_kv, N)
+            centroids,            # (n_centroids,)
+            vc.data,              # (B, H_kv, N, packed_d_v) uint8
+            vc.scales,            # (B, H_kv, N, n_groups)
+            vc.zeros,             # (B, H_kv, N, n_groups)
+            Pi,                   # (D, D) rotation matrix
+            S,                    # (D, D) sketch matrix
+            scale=scale,
+            qjl_scale=qjl_scale,
+            mse_bits=mse_eff_bits,
+            v_bits=self.value_bits,
+            group_size=self.value_group_size,
+        )
+        # acc: (B, H_q, 1, D), m: (B, H_q, 1), l: (B, H_q, 1)
         return acc, m, l
 
     def _fused_flat(
