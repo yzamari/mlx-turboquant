@@ -188,12 +188,50 @@ During attention, Metal kernels compute scores directly from the packed 3-bit da
 - MLX >= 0.22
 - MLX-LM >= 0.22
 
+## Comparison with CUDA Implementation
+
+The [upstream NVIDIA Triton implementation](https://github.com/0xSero/turboquant) is the reference. Here's how our Apple Silicon port compares:
+
+| Metric | CUDA (NVIDIA Triton) | Apple Metal (this repo) |
+|--------|:---:|:---:|
+| KV cache compression | 5x | 5x |
+| Output quality | 100% match | 100% match |
+| Memory savings | Full theoretical savings | 3 GB at 16K (partial — see below) |
+| Decode kernel | Fused Triton kernel | Native C++/Metal 1-pass + 2-pass |
+| Prefill | Standard cuDNN/Flash Attention | Chunked Metal kernels (slower) |
+| Bit widths | 2/3/4-bit flexible | 3-bit keys + 2-bit values only |
+| Head dimensions | Any | D=64 and D=128 |
+| Batch size | Any | B=1 only |
+| Hardware | NVIDIA GPU required | Apple Silicon (M1/M2/M3/M4) |
+
+### Where we're behind
+
+- **Prefill speed**: CUDA uses Flash Attention for prefill (fast). We use per-query Metal kernels (slower). This is why short contexts (< 4K) show no speedup.
+- **Theoretical memory**: At 16K with 5x compression, the KV cache should be ~400MB vs ~4GB. We save 3GB but not the full 3.6GB because compression intermediates and sequential layer flushing leave some overhead.
+- **Flexibility**: CUDA supports arbitrary bit widths and head dims. We're hardcoded to 3-bit/2-bit and D=64/128.
+
+### What would close the gap
+
+1. **Fuse rotation matrix into Q projection weights at patch time** — eliminates 128 extra matmuls per token, would make TQ faster at ALL context lengths
+2. **Use MLX's built-in Steel attention for prefill** instead of per-query Metal loop
+3. **FP16 norms/scales** — saves ~96MB across layers
+4. **Support B>1 and flexible bit widths**
+
+### Development Journey
+
+| Version | 16K Peak Memory | vs Standard | Speed |
+|:---:|:---:|:---:|:---:|
+| v1 (Python Metal kernels) | 29,891 MB | +7.5 GB worse | up to 3.7x faster |
+| v2 (native kernel + mx.eval fix) | 22,555 MB | -142 MB (parity) | 1.3x faster |
+| v3 (prefill compression) | **19,396 MB** | **3.0 GB saved** | 1.3x faster |
+
 ## Project Ecosystem
 
 | Repo | Purpose |
 |------|---------|
 | [turboQuantPlayground](https://github.com/yzamari/turboQuantPlayground) | Core TurboQuant algorithm, Metal kernels, educational notebooks |
 | [mlx-turboquant](https://github.com/yzamari/mlx-turboquant) (this repo) | MLX-LM integration for real inference |
+| [mlx-fork](https://github.com/yzamari/mlx-fork/tree/feature/turboquant-attention) | Fork of Apple's MLX with native `mx.fast.turboquant_attention()` kernel |
 | [turboquant-bench](https://github.com/yzamari/turboquant-bench) | All-in-one comparison benchmarks |
 
 ## References
