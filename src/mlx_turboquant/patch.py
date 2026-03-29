@@ -28,47 +28,46 @@ _attention_patched = False
 
 
 def _detect_head_dim(model: nn.Module) -> int:
-    """Detect head_dim by inspecting the first transformer layer."""
+    """Detect head_dim by scanning all layers for an attention module."""
     layers = getattr(model, "layers", None)
     if layers is None or len(layers) == 0:
         raise ValueError("Model has no .layers attribute; cannot detect head_dim")
 
-    layer0 = layers[0]
-
-    # Try common attribute paths for the attention module
-    attn = None
+    # Scan layers — prefer standard attention over SSM for head_dim detection
+    # (hybrid models like Qwen3.5 have different head dims per layer type)
     for attr_name in ("self_attn", "attention", "attn", "linear_attn"):
-        attn = getattr(layer0, attr_name, None)
-        if attn is not None:
-            break
-
-    if attn is None:
-        raise ValueError(
-            f"Cannot find attention module in layer 0. "
-            f"Available attrs: {[a for a in dir(layer0) if not a.startswith('_')]}"
-        )
-
-    # Try to get head_dim from the attention module
-    for attr in ("head_dim", "head_k_dim"):
-        head_dim = getattr(attn, attr, None)
-        if head_dim is not None:
-            return int(head_dim)
-
-    # Fallback: infer from k_proj weight shape
-    k_proj = getattr(attn, "k_proj", None)
-    if k_proj is not None:
-        weight = getattr(k_proj, "weight", None)
-        if weight is not None:
-            n_kv_heads = getattr(attn, "n_kv_heads", None) or getattr(
-                attn, "num_key_value_heads", None
-            )
-            if n_kv_heads is not None:
-                return weight.shape[0] // n_kv_heads
+        for layer in layers:
+            attn = getattr(layer, attr_name, None)
+            if attn is None:
+                continue
+            # Direct attribute
+            for dim_attr in ("head_dim", "head_k_dim"):
+                hd = getattr(attn, dim_attr, None)
+                if hd is not None:
+                    return int(hd)
+            # Fallback: infer from k_proj weight shape
+            k_proj = getattr(attn, "k_proj", None)
+            if k_proj is not None:
+                weight = getattr(k_proj, "weight", None)
+                if weight is not None:
+                    n_kv = getattr(attn, "n_kv_heads", None) or getattr(
+                        attn, "num_key_value_heads", None
+                    )
+                    if n_kv is not None:
+                        return weight.shape[0] // n_kv
 
     raise ValueError(
         "Cannot determine head_dim from the model architecture. "
         "Please specify it explicitly."
     )
+
+
+def _is_hybrid_model(model: nn.Module) -> bool:
+    """Check if model has mixed layer types (SSM + attention)."""
+    layers = getattr(model, "layers", None)
+    if layers is None:
+        return False
+    return any(getattr(layer, "is_linear", False) for layer in layers)
 
 
 def _detect_num_layers(model: nn.Module) -> int:
@@ -441,6 +440,37 @@ def make_turboquant_cache(
     if num_layers is None:
         num_layers = _detect_num_layers(model)
 
+    # For hybrid models (SSM+Attention like Qwen3.5), create mixed cache list:
+    # - SSM layers get MLX-LM's ArraysCache (unchanged)
+    # - Attention layers get TurboQuantCache (compressed)
+    if _is_hybrid_model(model):
+        try:
+            from mlx_lm.models.cache import ArraysCache
+        except ImportError:
+            ArraysCache = None
+
+        layers = model.layers
+        caches = []
+        tq_idx = 0
+        for i, layer in enumerate(layers):
+            is_linear = getattr(layer, "is_linear", False)
+            if is_linear and ArraysCache is not None:
+                caches.append(ArraysCache(size=2))
+            else:
+                caches.append(
+                    TurboQuantCache(
+                        head_dim=head_dim,
+                        key_bits=key_bits,
+                        value_bits=value_bits,
+                        value_group_size=value_group_size,
+                        buffer_size=buffer_size,
+                        layer_idx=tq_idx,
+                    )
+                )
+                tq_idx += 1
+        return caches
+
+    # Standard transformer: one TurboQuantCache per layer
     return [
         TurboQuantCache(
             head_dim=head_dim,

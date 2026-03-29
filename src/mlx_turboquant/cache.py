@@ -295,7 +295,45 @@ class TurboQuantCache(_BaseCache):
         mse_eff_bits = self.key_bits - 1  # TurboQuantProd uses bits-1 for MSE
         qjl_scale = self.key_quantizer.qjl_scale
 
-        # Use native C++/Metal kernel — handles GQA and query rotation internally
+        # Use native C++/Metal kernel if D is supported (64 or 128).
+        # For unsupported D (e.g., 256 in Qwen3.5), fall back to Python Metal kernel.
+        if D not in (64, 128):
+            # Fallback to Python Metal kernel for unsupported head dims
+            from mlx_turboquant.metal.fused_decode import turboquant_fused_decode_metal
+            Pi = self.key_quantizer.mse_quantizer.Pi
+            S = self.key_quantizer.S
+            n_kv_heads = kc.mse_indices.shape[1]
+            n_compressed = kc.mse_indices.shape[2]
+            n_heads_q = queries.shape[1]
+            q_flat = queries.reshape(B * n_heads_q, D)
+            q_rot = mx.matmul(q_flat.astype(mx.float32), mx.transpose(Pi))
+            q_sketch = mx.matmul(q_flat.astype(mx.float32), mx.transpose(S))
+            BH = B * n_kv_heads
+            acc, m, l = turboquant_fused_decode_metal(
+                q_rot=q_rot, q_sketch=q_sketch,
+                mse=kc.mse_indices.reshape(BH, n_compressed, -1),
+                signs=kc.qjl_signs.reshape(BH, n_compressed, -1),
+                norms=kc.norms.reshape(BH, n_compressed),
+                res_norms=kc.residual_norms.reshape(BH, n_compressed),
+                centroids=centroids,
+                v_data=vc.data.reshape(BH, n_compressed, -1),
+                v_scales=vc.scales.reshape(BH, n_compressed, -1),
+                v_zeros=vc.zeros.reshape(BH, n_compressed, -1),
+                mse_bits=self.key_bits, v_bits=self.value_bits,
+                D=D, group_size=self.value_group_size,
+                qjl_scale=qjl_scale, sm_scale=scale,
+            )
+            acc = acc.reshape(B, n_kv_heads, 1, D)
+            m = m.reshape(B, n_kv_heads, 1)
+            l = l.reshape(B, n_kv_heads, 1)
+            # Expand for GQA if needed
+            if n_heads_q != n_kv_heads:
+                repeats = n_heads_q // n_kv_heads
+                acc = mx.repeat(acc, repeats, axis=1)
+                m = mx.repeat(m, repeats, axis=1)
+                l = mx.repeat(l, repeats, axis=1)
+            return acc, m, l
+
         # Input shapes: queries (B, H_q, 1, D), kc.mse_indices (B, H_kv, N, packed_d)
         acc, m, l = mx.fast.turboquant_attention(
             queries,
@@ -732,15 +770,19 @@ class TurboQuantCache(_BaseCache):
 
     # ---- _BaseCache interface ----
 
-    def make_mask(self, *args, **kwargs):
-        kwargs.setdefault("offset", self.offset)
-        try:
-            return create_attention_mask(*args, **kwargs)
-        except TypeError:
-            # Fallback for models that call make_mask with different signatures
-            # (e.g., SSM layers in Qwen3.5 hybrid models)
-            h_len = args[0] if args else kwargs.get("h", 0)
-            return None
+    def make_mask(self, N, return_array=False, window_size=None):
+        """Create causal mask, compatible with both attention and SSM callers."""
+        if N > 1 and self.offset > 0:
+            return create_attention_mask(
+                mx.zeros((1, N, 1)), cache=self,
+                return_array=return_array, window_size=window_size,
+            )
+        if N > 1:
+            if return_array:
+                from mlx_lm.models.base import create_causal_mask
+                return create_causal_mask(N, window_size=window_size)
+            return "causal"
+        return None
 
     @property
     def state(self):
