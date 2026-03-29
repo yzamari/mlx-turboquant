@@ -54,6 +54,16 @@ This is a hybrid model: 30/40 layers use GatedDeltaNet (SSM), 10/40 use standard
 | Medium (673 tok) | 55.0 tok/s | **56.9 tok/s** | **103%** | - |
 | Long (1115 tok) | 54.2 tok/s | 50.9 tok/s | 94% | - |
 
+Long context on the same model (TQ only compresses 10/40 attention layers):
+
+| Prompt | Standard | TurboQuant | Speed |
+|:---:|:---:|:---:|:---:|
+| 4K | 21.2 tok/s | **36.3 tok/s** | **1.7x** |
+| 16K | 4.3 tok/s | **33.3 tok/s** | **7.7x** |
+| 32K | 11.1 tok/s | **58.6 tok/s** | **5.3x** |
+
+Up to **7.7x faster at 16K** — even though TQ only applies to 25% of the layers. Memory at parity (~21-23 GB, model weights dominate).
+
 ### KV Cache Compression Ratio
 
 | Tokens | FP16 Cache | TurboQuant 3-bit | Ratio |
