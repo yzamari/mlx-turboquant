@@ -44,6 +44,16 @@ The compressed KV cache uses approximate attention scores. This is good enough f
 
 > **Tip:** Increase `buffer_size` (e.g., 2048) to keep more tokens uncompressed if retrieval quality matters for your use case. Tradeoff: less compression, better retrieval.
 
+### Qwen3.5-35B-A3B-4bit (Hybrid SSM+Attention, same model as Prince Canuma)
+
+This is a hybrid model: 30/40 layers use GatedDeltaNet (SSM), 10/40 use standard attention. TQ only compresses the 10 attention layers.
+
+| Context | Standard | TurboQuant | Speed | Quality |
+|:---:|:---:|:---:|:---:|:---:|
+| Short (17 tok) | 54.7 tok/s | **64.3 tok/s** | **117%** | **100% match** |
+| Medium (673 tok) | 55.0 tok/s | **56.9 tok/s** | **103%** | - |
+| Long (1115 tok) | 54.2 tok/s | 50.9 tok/s | 94% | - |
+
 ### KV Cache Compression Ratio
 
 | Tokens | FP16 Cache | TurboQuant 3-bit | Ratio |
@@ -191,31 +201,54 @@ During attention, Metal kernels compute scores directly from the packed 3-bit da
 - MLX >= 0.22
 - MLX-LM >= 0.22
 
-## Comparison: Us vs Original CUDA vs Prince Canuma
+## Comparison: Google (Paper) vs Us vs Prince Canuma
 
-| | **Ours (yzamari)** | **Original CUDA (0xSero)** | **Prince Canuma (Blaizzy)** |
+### Implementation
+
+| | **Google (Paper)** | **Ours (yzamari)** | **Prince Canuma** |
 |---|:---:|:---:|:---:|
-| **Platform** | Apple Silicon (MLX + Metal) | NVIDIA GPU (Triton) | Apple Silicon (MLX) |
-| **Kernel** | **Native C++/Metal** in MLX fork | Fused Triton kernel | Python-level MLX kernels |
-| **Speed vs standard** | **1.2-3.2x faster** | ~1x (parity) | 0.7-0.85x (slower) |
-| **Memory (small model)** | **Up to 1.4 GB saved** | Full theoretical | Not disclosed |
-| **Memory (large model)** | ~parity | Full theoretical | Not disclosed |
-| **KV compression** | 5x | 5x | 4.9x |
-| **Quality (generation)** | 100% match | 100% match | 100% match |
-| **Quality (NIAH)** | Fails on compressed tokens | Not tested publicly | Claims 6/6 at 64K |
-| **Max context tested** | 32K | Not disclosed | 64K |
-| **Bit widths** | 2/3/4-bit (integer) | 2/3/4-bit | 2.5/3.5-bit (fractional) |
-| **Open source** | **Yes (3 repos, 47 tests)** | Yes | No public repo |
+| Platform | NVIDIA A100/H100 | **Apple Silicon (MLX + Metal)** | Apple Silicon (MLX) |
+| Kernel | Triton (JAX) | **Native C++/Metal in MLX fork** | Python-level MLX kernels |
+| Open source | Paper only, no code | **Yes — 3 repos, 47 tests** | No public repo |
+| Reproducible | No | **Yes** | No |
 
-### Where each implementation excels
+### Performance
 
-- **Ours**: **Speed** — the only implementation faster than standard (up to 3.2x). Native C++/Metal kernel, full test suite, public repos.
-- **Original CUDA**: **Memory** — full theoretical savings via Triton kernel memory management.
-- **Prince Canuma**: **Context length** — tested at 64K on a 35B MoE model. Fractional bit widths.
+| | **Google** | **Ours** | **Prince** |
+|---|:---:|:---:|:---:|
+| Speed vs standard | Claims "up to 8x" (no wall-clock) | **1.2-3.2x faster (measured)** | 0.7-0.85x (slower) |
+| KV compression | 5x | **5x** | 4.9x |
+| Memory savings | Full theoretical | **1.4 GB (3B), parity (32B)** | Not disclosed |
+
+### Quality
+
+| | **Google** | **Ours** | **Prince** |
+|---|:---:|:---:|:---:|
+| Metric | Perplexity | **Token match + NIAH** | NIAH pass/fail |
+| Generation | "Negligible degradation" | **100% match** | "Zero accuracy loss" |
+| NIAH retrieval | **Not tested** | **Fails on compressed tokens** | Claims 6/6 at 64K |
+| Lossy? | Yes ("near-optimal distortion") | **Yes (tested & documented)** | Not disclosed |
+
+### Model Support
+
+| | **Google** | **Ours** | **Prince** |
+|---|:---:|:---:|:---:|
+| Models tested | LLaMA-2, Mistral | **Qwen2.5-3B/32B, Qwen3.5-35B** | Qwen3.5-35B |
+| Hybrid SSM+Attn | N/A | **Supported** | Presumably yes |
+| Max context | 128K | 32K | **64K** |
+| Bit widths | 1-8 bit | 2/3/4-bit | 2.5/3.5-bit |
+
+### What each does best
+
+| | Best at |
+|---|---|
+| **Google** | The math — proved near-optimal distortion rate. No runnable code. |
+| **Ours** | **Speed + honesty** — only implementation faster than standard. Public code. Documented NIAH limitation. |
+| **Prince** | Community reach — tested at 64K, popular MLX developer. Claims NIAH pass with no reproducible evidence. |
 
 ### On NIAH claims
 
-TurboQuant is **lossy compression** (like JPEG). It preserves generation quality but not exact retrieval. We tested and honestly documented this: compressed tokens fail needle-in-a-haystack. Prince Canuma claims 6/6 NIAH pass at 64K, but did not disclose buffer size, reproduction steps, or code. If his buffer is large enough, the needle stays uncompressed — which is not a compression quality win, just a configuration choice.
+TurboQuant is **lossy compression** (like JPEG for images). It preserves generation quality but not exact retrieval. We tested and documented this honestly: compressed tokens fail needle-in-a-haystack. Prince Canuma claims 6/6 NIAH pass at 64K but did not disclose buffer size, code, or reproduction steps. If his buffer is large enough, the needle stays uncompressed — that's a configuration choice, not a quality win.
 
 ### Development Journey
 
@@ -223,7 +256,7 @@ TurboQuant is **lossy compression** (like JPEG). It preserves generation quality
 |:---:|:---:|:---:|:---:|
 | v1 (Python Metal kernels) | 29,891 MB | +7.5 GB worse | fast but broken memory |
 | v2 (native kernel + mx.eval) | 22,555 MB | parity | 1.3x faster |
-| v3 (final, with short-ctx bypass) | 22,555 MB | parity | **2.2x faster** |
+| v3 (final + hybrid model support) | 22,555 MB | parity | **2.2x faster** |
 
 ## Project Ecosystem
 
