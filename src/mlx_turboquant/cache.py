@@ -109,16 +109,17 @@ class TurboQuantCache(_BaseCache):
             self._key_buffer = keys
             self._value_buffer = values
 
-        # Compress when buffer exceeds threshold, during both prefill and decode.
-        # During prefill: tokens are compressed incrementally as the buffer fills,
-        # keeping peak memory bounded. The chunked prefill attention path handles
-        # compressed + buffer data via Metal kernels.
-        # During decode: same batched flush logic applies.
+        # Compress only during DECODE (n_new=1), not during prefill.
+        # Reason: compressed attention is approximate — it works well for
+        # generation (where output quality is measured by fluency) but fails
+        # needle-in-a-haystack retrieval tasks because the compression loses
+        # exact position information. Keeping prefill tokens in FP16 ensures
+        # the prompt is attended to with full precision.
         #
-        # Flush in BATCHES (flush_batch_size tokens at a time) so the d×d matmuls
-        # operate on (128, d) instead of (1, d) — GPU-saturated.
+        # Flush in BATCHES (flush_batch_size tokens at a time) so the d×d
+        # matmuls operate on (128, d) instead of (1, d) — GPU-saturated.
         flush_threshold = self.buffer_size + self.flush_batch_size
-        if self._key_buffer.shape[2] > flush_threshold:
+        if not is_prefill and self._key_buffer.shape[2] > flush_threshold:
             self._flush()
 
         # Return ONLY the buffer -- compressed data is handled by patched attention
