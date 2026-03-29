@@ -733,7 +733,14 @@ class TurboQuantCache(_BaseCache):
     # ---- _BaseCache interface ----
 
     def make_mask(self, *args, **kwargs):
-        return create_attention_mask(*args, offset=self.offset, **kwargs)
+        kwargs.setdefault("offset", self.offset)
+        try:
+            return create_attention_mask(*args, **kwargs)
+        except TypeError:
+            # Fallback for models that call make_mask with different signatures
+            # (e.g., SSM layers in Qwen3.5 hybrid models)
+            h_len = args[0] if args else kwargs.get("h", 0)
+            return None
 
     @property
     def state(self):

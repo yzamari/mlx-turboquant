@@ -49,9 +49,10 @@ def _detect_head_dim(model: nn.Module) -> int:
         )
 
     # Try to get head_dim from the attention module
-    head_dim = getattr(attn, "head_dim", None)
-    if head_dim is not None:
-        return int(head_dim)
+    for attr in ("head_dim", "head_k_dim"):
+        head_dim = getattr(attn, attr, None)
+        if head_dim is not None:
+            return int(head_dim)
 
     # Fallback: infer from k_proj weight shape
     k_proj = getattr(attn, "k_proj", None)
