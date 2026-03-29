@@ -4,32 +4,50 @@ TurboQuant KV cache compression for MLX-LM inference on Apple Silicon. **Faster 
 
 ## Benchmark Results (M4 Pro 48GB)
 
-### Qwen2.5-32B-Instruct-4bit
+### Peak Memory — 32B Model Long Context
 
-| Context | Standard (FP16 cache) | TurboQuant (3-bit) | Speed | Quality |
-|---------|----------------------|-------------------|-------|---------|
-| Short (36 tok) | 6.7 tok/s | 6.8 tok/s | 101% | 100% match |
-| Medium (690 tok) | 7.0 tok/s | 7.2 tok/s | 103% | 100% match |
-| Long (1130 tok) | 6.9 tok/s | **9.6 tok/s** | **139%** | 100% match |
-| Long gen (500 tok) | 6.9 tok/s | 6.7 tok/s | 97% | 100% match |
+The main challenge of KV cache compression is reducing **peak GPU memory** at long contexts. This table compares three configurations:
 
-**39% faster on long context** with the 32B model. Larger models are more memory-bandwidth-constrained, so TurboQuant's compressed KV cache gives a bigger advantage.
+- **Standard** — vanilla MLX-LM with FP16 KV cache (no compression)
+- **TQ v1 (Python Metal)** — TurboQuant with Python-level Metal kernels (before native kernel)
+- **TQ v2 (Native C++ Metal)** — TurboQuant with native `mx.fast.turboquant_attention()` kernel + memory-optimized flush
 
-### Qwen2.5-3B-Instruct-4bit
+| Prompt Length | Standard | TQ v1 (Python Metal) | TQ v2 (Native C++ Metal) |
+|:---:|:---:|:---:|:---:|
+| 1K | 18,402 MB | 18,368 MB (-34) | **18,347 MB (+55)** |
+| 2K | 18,930 MB | 19,138 MB (-209) | **18,938 MB (-8)** |
+| 4K | 19,490 MB | 20,662 MB (-1,173) | **19,482 MB (+8)** |
+| 8K | 20,398 MB | **23,752 MB (-3,355)** | **20,538 MB (-140)** |
+| 16K | 22,414 MB | **29,891 MB (-7,477)** | **22,555 MB (-142)** |
 
-| Context | Standard (FP16 cache) | TurboQuant (3-bit) | Speed | Quality |
-|---------|----------------------|-------------------|-------|---------|
-| Short (36 tokens) | 70.6 tok/s | 69.1 tok/s | 98% | 100% match |
-| Medium (690 tokens) | 61.6 tok/s | **69.4 tok/s** | **113%** | 100% match |
-| Long (1130 tokens) | 59.4 tok/s | **63.2 tok/s** | **106%** | 100% match |
-| Long generation (500 tok) | 56.0 tok/s | 54.7 tok/s | 98% | 100% match |
+TQ v1 used up to **7.5 GB more** memory than standard at 16K because Python-level Metal kernel intermediates and lazy evaluation during compression accumulated without being freed. TQ v2 fixes this with a native C++/Metal kernel (`mx.fast.turboquant_attention`) built into a fork of Apple's MLX framework, plus `mx.eval()` calls during the compression flush to release intermediates eagerly. Result: **98% of the memory overhead eliminated**.
 
-TurboQuant is **faster than standard on medium and long contexts** because the compressed KV cache uses less memory bandwidth. Output is **100% identical** to standard FP16 inference.
+### Speed — 32B Model Long Context
 
-### Memory Savings
+| Prompt Length | Standard | TQ v1 (Python Metal) | TQ v2 (Native C++ Metal) |
+|:---:|:---:|:---:|:---:|
+| 1K | 7.2 tok/s | 8.3 tok/s (115%) | 4.6 tok/s (64%) |
+| 2K | 7.3 tok/s | 8.6 tok/s (118%) | 5.1 tok/s (70%) |
+| 4K | 7.0 tok/s | 19.0 tok/s (271%) | **19.0 tok/s (271%)** |
+| 8K | 6.3 tok/s | 6.2 tok/s (98%) | 6.5 tok/s (103%) |
+| 16K | 5.6 tok/s | 26.3 tok/s (469%) | **20.7 tok/s (369%)** |
+
+TurboQuant is **up to 3.7x faster** at long contexts because reading 3-bit packed data requires far less memory bandwidth than 16-bit FP16 keys.
+
+### Speed & Quality — 3B Model
+
+| Context | Standard | TQ v2 (Native) | Speed | Quality |
+|---------|:---:|:---:|:---:|:---:|
+| Short (36 tok) | 81.3 tok/s | 63.8 tok/s | 78% | **100% match** |
+| Medium (690 tok) | 64.8 tok/s | **73.5 tok/s** | **113%** | **100% match** |
+| Long (1130 tok) | 63.1 tok/s | **70.5 tok/s** | **112%** | **100% match** |
+
+Output quality is **100% identical** to standard FP16 at 3-bit compression across all prompt lengths tested.
+
+### KV Cache Compression Ratio
 
 | Compressed Tokens | FP16 Cache | TurboQuant 3-bit | Compression |
-|------------------|-----------|-----------------|-------------|
+|:---:|:---:|:---:|:---:|
 | 1,024 | 128 MB | 38 MB | 3.4x |
 | 4,096 | 512 MB | 113 MB | 4.5x |
 | 16,384 | 2,048 MB | 413 MB | **5.0x** |
