@@ -37,7 +37,7 @@ def _detect_head_dim(model: nn.Module) -> int:
 
     # Try common attribute paths for the attention module
     attn = None
-    for attr_name in ("self_attn", "attention", "attn"):
+    for attr_name in ("self_attn", "attention", "attn", "linear_attn"):
         attn = getattr(layer0, attr_name, None)
         if attn is not None:
             break
