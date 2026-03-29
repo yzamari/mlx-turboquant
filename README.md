@@ -16,7 +16,9 @@ TurboQuant uses **less peak GPU memory** than standard at every context length:
 | 8K | 20,398 MB | **18,988 MB** | **1.4 GB** |
 | 16K | 22,414 MB | **19,396 MB** | **3.0 GB** |
 
-At 16K context, TurboQuant saves **3 GB** of peak GPU memory. Savings grow with context length because the 5x-compressed cache scales much better than FP16.
+Peak memory is at **parity** with standard (not higher, not lower). Memory savings become visible in very long conversations where the compressed cache grows much slower than FP16.
+
+> **Why not lower?** During prefill (processing the prompt), all tokens stay in an FP16 buffer — same as standard. Compression starts during decode. We tested prefill compression but reverted it: compressed attention is approximate and fails needle-in-a-haystack retrieval tasks. Correctness > memory savings.
 
 ### 32B Model — Speed
 
@@ -206,9 +208,12 @@ The [upstream NVIDIA Triton implementation](https://github.com/0xSero/turboquant
 
 ### Where we're behind
 
-- **Prefill speed**: CUDA uses Flash Attention for prefill (fast). We use per-query Metal kernels (slower). This is why short contexts (< 4K) show no speedup.
-- **Theoretical memory**: At 16K with 5x compression, the KV cache should be ~400MB vs ~4GB. We save 3GB but not the full 3.6GB because compression intermediates and sequential layer flushing leave some overhead.
+- **Peak memory during prefill**: CUDA compresses incrementally during prefill. We keep all prefill tokens in FP16 to preserve needle-in-a-haystack retrieval quality. Peak memory is at parity with standard, not lower.
 - **Flexibility**: CUDA supports arbitrary bit widths and head dims. We're hardcoded to 3-bit/2-bit and D=64/128.
+
+### Known limitation: NIAH with compression
+
+Compressed attention is approximate — it preserves fluent generation (100% token match) but can fail exact retrieval tasks (needle-in-a-haystack). With `buffer_size=128`, tokens beyond the buffer are compressed, and specific facts may not be retrievable. Increasing `buffer_size` (e.g., to 2048) keeps more tokens in full precision at the cost of less compression.
 
 ### What would close the gap
 
