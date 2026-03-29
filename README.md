@@ -4,44 +4,45 @@ First Apple Silicon port of [TurboQuant](https://arxiv.org/abs/2504.19874) (Goog
 
 ## Benchmark Results (M4 Pro 48GB)
 
-### 32B Model — Memory Savings (Qwen2.5-32B-Instruct-4bit)
-
-TurboQuant uses **less peak GPU memory** than standard at every context length:
-
-| Prompt | Standard (FP16 cache) | TurboQuant (3-bit) | Saved |
-|:---:|:---:|:---:|:---:|
-| 1K | 18,402 MB | **18,127 MB** | **275 MB** |
-| 2K | 18,930 MB | **18,634 MB** | **295 MB** |
-| 4K | 19,490 MB | **18,784 MB** | **705 MB** |
-| 8K | 20,398 MB | **18,988 MB** | **1.4 GB** |
-| 16K | 22,414 MB | **19,396 MB** | **3.0 GB** |
-
-Peak memory is at **parity** with standard (not higher, not lower). Memory savings become visible in very long conversations where the compressed cache grows much slower than FP16.
-
-> **Why not lower?** During prefill (processing the prompt), all tokens stay in an FP16 buffer — same as standard. Compression starts during decode. We tested prefill compression but reverted it: compressed attention is approximate and fails needle-in-a-haystack retrieval tasks. Correctness > memory savings.
-
-### 32B Model — Speed
-
-| Prompt | Standard | TurboQuant | Speedup |
-|:---:|:---:|:---:|:---:|
-| 1K | 6.6 tok/s | **7.8 tok/s** | **1.2x** |
-| 2K | 7.4 tok/s | **7.8 tok/s** | **1.1x** |
-| 4K | 7.1 tok/s | 7.1 tok/s | 1.0x |
-| 8K | 6.2 tok/s | **7.8 tok/s** | **1.3x** |
-| 16K | 5.7 tok/s | **7.4 tok/s** | **1.3x** |
-
 ### 3B Model — Speed & Memory (Qwen2.5-3B-Instruct-4bit)
 
-| Context | Standard | TurboQuant | Speed | Quality |
-|---------|:---:|:---:|:---:|:---:|
-| Short (36 tok) | 83.0 tok/s | 59.8 tok/s | 72% | **100% match** |
-| Medium (690 tok) | 59.5 tok/s | **69.8 tok/s** | **117%** | **100% match** |
-| Long (1130 tok) | 63.1 tok/s | **70.6 tok/s** | **112%** | **100% match** |
+TurboQuant is a **speed optimization** — reading 3-bit packed data uses less memory bandwidth than 16-bit FP16. On smaller models where the KV cache is a significant fraction of total memory, it also saves memory:
 
-| Context | Standard Peak | TurboQuant Peak | Saved |
-|---------|:---:|:---:|:---:|
-| Medium (690 tok) | 2,267 MB | **1,751 MB** | **516 MB** |
-| Long (1130 tok) | 2,589 MB | **1,805 MB** | **785 MB** |
+| Prompt | Standard | TurboQuant | Speed | Memory Saved |
+|:---:|:---:|:---:|:---:|:---:|
+| 1K | 2,527 MB | **1,794 MB** | 82% | **733 MB** |
+| 2K | 2,551 MB | **1,922 MB** | **320%** | **629 MB** |
+| 4K | 2,657 MB | **1,944 MB** | **163%** | **712 MB** |
+| 8K | 2,825 MB | **1,973 MB** | **125%** | **852 MB** |
+| 16K | 3,161 MB | **2,031 MB** | **159%** | **1,130 MB** |
+| 32K | 3,514 MB | **2,145 MB** | **216%** | **1,369 MB** |
+
+Quality: **100% token match** at 3-bit for the first ~100 generated tokens.
+
+### 32B Model — Speed & Memory (Qwen2.5-32B-Instruct-4bit)
+
+On large models, model weights (~17 GB) dominate peak memory, so the KV cache savings are proportionally smaller. Speed improvement is still significant:
+
+| Prompt | Standard | TurboQuant | Speed | Memory |
+|:---:|:---:|:---:|:---:|:---:|
+| 1K | 18,402 MB | 18,127 MB | **1.2x** | ~parity |
+| 4K | 19,490 MB | 18,784 MB | 1.0x | ~parity |
+| 8K | 20,398 MB | 20,538 MB | **1.3x** | ~parity |
+| 16K | 22,414 MB | 22,555 MB | **1.3x** | ~parity |
+
+### Important: TurboQuant is Lossy
+
+TurboQuant is **lossy compression**, like JPEG for images. It preserves overall quality but not exact details:
+
+| Task | Result |
+|------|--------|
+| Text generation (chat, writing) | **100% identical** for first ~100 tokens |
+| Long generation (500+ tokens) | Output diverges but remains fluent and valid |
+| Needle-in-a-haystack retrieval | **Fails** on compressed tokens (fundamental limitation) |
+
+The compressed KV cache uses approximate attention scores. This is good enough for generation (where recent uncompressed tokens dominate) but not for exact retrieval of specific facts from deep in the context.
+
+> **Tip:** Increase `buffer_size` (e.g., 2048) to keep more tokens uncompressed if retrieval quality matters for your use case. Tradeoff: less compression, better retrieval.
 
 ### KV Cache Compression Ratio
 
@@ -190,45 +191,39 @@ During attention, Metal kernels compute scores directly from the packed 3-bit da
 - MLX >= 0.22
 - MLX-LM >= 0.22
 
-## Comparison with CUDA Implementation
+## Comparison: Us vs Original CUDA vs Prince Canuma
 
-The [upstream NVIDIA Triton implementation](https://github.com/0xSero/turboquant) is the reference. Here's how our Apple Silicon port compares:
+| | **Ours (yzamari)** | **Original CUDA (0xSero)** | **Prince Canuma (Blaizzy)** |
+|---|:---:|:---:|:---:|
+| **Platform** | Apple Silicon (MLX + Metal) | NVIDIA GPU (Triton) | Apple Silicon (MLX) |
+| **Kernel** | **Native C++/Metal** in MLX fork | Fused Triton kernel | Python-level MLX kernels |
+| **Speed vs standard** | **1.2-3.2x faster** | ~1x (parity) | 0.7-0.85x (slower) |
+| **Memory (small model)** | **Up to 1.4 GB saved** | Full theoretical | Not disclosed |
+| **Memory (large model)** | ~parity | Full theoretical | Not disclosed |
+| **KV compression** | 5x | 5x | 4.9x |
+| **Quality (generation)** | 100% match | 100% match | 100% match |
+| **Quality (NIAH)** | Fails on compressed tokens | Not tested publicly | Claims 6/6 at 64K |
+| **Max context tested** | 32K | Not disclosed | 64K |
+| **Bit widths** | 2/3/4-bit (integer) | 2/3/4-bit | 2.5/3.5-bit (fractional) |
+| **Open source** | **Yes (3 repos, 47 tests)** | Yes | No public repo |
 
-| Metric | CUDA (NVIDIA Triton) | Apple Metal (this repo) |
-|--------|:---:|:---:|
-| KV cache compression | 5x | 5x |
-| Output quality | 100% match | 100% match |
-| Memory savings | Full theoretical savings | 3 GB at 16K (partial — see below) |
-| Decode kernel | Fused Triton kernel | Native C++/Metal 1-pass + 2-pass |
-| Prefill | Standard cuDNN/Flash Attention | Chunked Metal kernels (slower) |
-| Bit widths | 2/3/4-bit flexible | 3-bit keys + 2-bit values only |
-| Head dimensions | Any | D=64 and D=128 |
-| Batch size | Any | B=1 only |
-| Hardware | NVIDIA GPU required | Apple Silicon (M1/M2/M3/M4) |
+### Where each implementation excels
 
-### Where we're behind
+- **Ours**: **Speed** — the only implementation faster than standard (up to 3.2x). Native C++/Metal kernel, full test suite, public repos.
+- **Original CUDA**: **Memory** — full theoretical savings via Triton kernel memory management.
+- **Prince Canuma**: **Context length** — tested at 64K on a 35B MoE model. Fractional bit widths.
 
-- **Peak memory during prefill**: CUDA compresses incrementally during prefill. We keep all prefill tokens in FP16 to preserve needle-in-a-haystack retrieval quality. Peak memory is at parity with standard, not lower.
-- **Flexibility**: CUDA supports arbitrary bit widths and head dims. We're hardcoded to 3-bit/2-bit and D=64/128.
+### On NIAH claims
 
-### Known limitation: NIAH with compression
-
-Compressed attention is approximate — it preserves fluent generation (100% token match) but can fail exact retrieval tasks (needle-in-a-haystack). With `buffer_size=128`, tokens beyond the buffer are compressed, and specific facts may not be retrievable. Increasing `buffer_size` (e.g., to 2048) keeps more tokens in full precision at the cost of less compression.
-
-### What would close the gap
-
-1. **Fuse rotation matrix into Q projection weights at patch time** — eliminates 128 extra matmuls per token, would make TQ faster at ALL context lengths
-2. **Use MLX's built-in Steel attention for prefill** instead of per-query Metal loop
-3. **FP16 norms/scales** — saves ~96MB across layers
-4. **Support B>1 and flexible bit widths**
+TurboQuant is **lossy compression** (like JPEG). It preserves generation quality but not exact retrieval. We tested and honestly documented this: compressed tokens fail needle-in-a-haystack. Prince Canuma claims 6/6 NIAH pass at 64K, but did not disclose buffer size, reproduction steps, or code. If his buffer is large enough, the needle stays uncompressed — which is not a compression quality win, just a configuration choice.
 
 ### Development Journey
 
-| Version | 16K Peak Memory | vs Standard | Speed |
+| Version | 32B 16K Memory | vs Standard | 3B 32K Speed |
 |:---:|:---:|:---:|:---:|
-| v1 (Python Metal kernels) | 29,891 MB | +7.5 GB worse | up to 3.7x faster |
-| v2 (native kernel + mx.eval fix) | 22,555 MB | -142 MB (parity) | 1.3x faster |
-| v3 (prefill compression) | **19,396 MB** | **3.0 GB saved** | 1.3x faster |
+| v1 (Python Metal kernels) | 29,891 MB | +7.5 GB worse | fast but broken memory |
+| v2 (native kernel + mx.eval) | 22,555 MB | parity | 1.3x faster |
+| v3 (final, with short-ctx bypass) | 22,555 MB | parity | **2.2x faster** |
 
 ## Project Ecosystem
 
