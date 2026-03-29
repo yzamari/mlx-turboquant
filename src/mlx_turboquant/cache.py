@@ -109,18 +109,16 @@ class TurboQuantCache(_BaseCache):
             self._key_buffer = keys
             self._value_buffer = values
 
-        # During prefill: DON'T compress. Keep everything in buffer for fast
-        # standard attention. Only start compressing during decode (n_new=1)
-        # when buffer overflows past the batch threshold.
+        # Compress when buffer exceeds threshold, during both prefill and decode.
+        # During prefill: tokens are compressed incrementally as the buffer fills,
+        # keeping peak memory bounded. The chunked prefill attention path handles
+        # compressed + buffer data via Metal kernels.
+        # During decode: same batched flush logic applies.
         #
-        # CRITICAL OPTIMIZATION: flush in BATCHES, not one token at a time.
-        # With buffer_size=128 and flush_batch_size=128, the effective buffer
-        # is 256 tokens. When it hits 257, we flush 128 tokens in one batch.
-        # This means the 3 dense d×d matmuls (rotation, inverse rotation, QJL)
-        # operate on (128, d) instead of (1, d) — GPU-saturated instead of
-        # catastrophically underutilized. Amortized cost drops ~100x.
+        # Flush in BATCHES (flush_batch_size tokens at a time) so the d×d matmuls
+        # operate on (128, d) instead of (1, d) — GPU-saturated.
         flush_threshold = self.buffer_size + self.flush_batch_size
-        if not is_prefill and self._key_buffer.shape[2] > flush_threshold:
+        if self._key_buffer.shape[2] > flush_threshold:
             self._flush()
 
         # Return ONLY the buffer -- compressed data is handled by patched attention

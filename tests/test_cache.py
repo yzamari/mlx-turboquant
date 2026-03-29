@@ -383,10 +383,10 @@ class TestEdgeCases:
         assert out_k.shape[2] <= cache.buffer_size + cache.flush_batch_size
 
     def test_large_prefill(self):
-        """Large prefill keeps everything in buffer (no compression during prefill).
+        """Large prefill compresses incrementally — buffer stays bounded.
 
-        Prefill intentionally does NOT compress -- it keeps all tokens in the
-        buffer for fast standard attention. Compression starts during decode.
+        Compression happens during prefill when buffer exceeds threshold,
+        keeping peak memory low.
         """
         cache = _make_cache(buffer_size=16)
         keys, values = _random_kv(256)
@@ -394,20 +394,18 @@ class TestEdgeCases:
         mx.eval(out_k, out_v)
 
         assert cache.offset == 256
-        # All 256 tokens stay in buffer during prefill (no compression)
-        assert out_k.shape[2] == 256
-        assert cache.compressed_tokens == 0
-        assert cache.buffer_tokens == 256
+        # Buffer is bounded — most tokens are compressed during prefill
+        assert cache.compressed_tokens > 0
+        assert cache.buffer_tokens <= cache.buffer_size + cache.flush_batch_size
+        assert cache.compressed_tokens + cache.buffer_tokens == 256
 
-        # Now feed one decode token -- this should trigger compression
-        # since buffer (257) > threshold (16 + 16 = 32)
+        # Decode token appends normally
         k, v = _random_kv(1)
         out_k, out_v = cache.update_and_fetch(k, v)
         mx.eval(out_k, out_v)
 
         assert cache.offset == 257
-        assert cache.compressed_tokens > 0
-        assert cache.buffer_tokens <= cache.buffer_size + cache.flush_batch_size
+        assert cache.compressed_tokens + cache.buffer_tokens == 257
 
 
 class TestCompressedScores:
