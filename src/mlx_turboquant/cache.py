@@ -772,17 +772,17 @@ class TurboQuantCache(_BaseCache):
 
     def make_mask(self, N, return_array=False, window_size=None):
         """Create causal mask, compatible with both attention and SSM callers."""
-        if N > 1 and self.offset > 0:
-            return create_attention_mask(
-                mx.zeros((1, N, 1)), cache=self,
-                return_array=return_array, window_size=window_size,
-            )
-        if N > 1:
-            if return_array:
+        if N == 1:
+            return None
+        if self.offset > 0 or return_array or (window_size and N > window_size):
+            try:
                 from mlx_lm.models.base import create_causal_mask
-                return create_causal_mask(N, window_size=window_size)
-            return "causal"
-        return None
+                return create_causal_mask(
+                    N, offset=self.offset, window_size=window_size,
+                )
+            except (ImportError, TypeError):
+                return "causal"
+        return "causal"
 
     @property
     def state(self):
