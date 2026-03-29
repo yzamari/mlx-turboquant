@@ -2,41 +2,44 @@
 
 First Apple Silicon port of [TurboQuant](https://arxiv.org/abs/2504.19874) (Google Research, ICLR 2026). Compresses the KV cache by 5x and runs **up to 3.7x faster** at long contexts — with **100% identical output quality**. Includes a native C++/Metal GPU kernel (`mx.fast.turboquant_attention`) that computes attention directly from compressed data without ever decompressing it.
 
-## Benchmark Results (M4 Pro 48GB, Qwen2.5-32B-Instruct-4bit)
+## Benchmark Results (M4 Pro 48GB)
 
-### Speed
+### 32B Model — Memory Savings (Qwen2.5-32B-Instruct-4bit)
 
-TurboQuant reads 3-bit packed data instead of 16-bit FP16, using far less memory bandwidth. This makes it **faster than standard** at medium and long contexts:
+TurboQuant uses **less peak GPU memory** than standard at every context length:
 
-| Prompt Length | Standard (FP16 cache) | TurboQuant (3-bit) | Speedup |
+| Prompt | Standard (FP16 cache) | TurboQuant (3-bit) | Saved |
 |:---:|:---:|:---:|:---:|
-| 1K | 7.2 tok/s | 4.6 tok/s | 0.6x |
-| 2K | 7.3 tok/s | 5.1 tok/s | 0.7x |
-| 4K | 7.0 tok/s | **19.0 tok/s** | **2.7x** |
-| 8K | 6.3 tok/s | 6.5 tok/s | 1.0x |
-| 16K | 5.6 tok/s | **20.7 tok/s** | **3.7x** |
+| 1K | 18,402 MB | **18,127 MB** | **275 MB** |
+| 2K | 18,930 MB | **18,634 MB** | **295 MB** |
+| 4K | 19,490 MB | **18,784 MB** | **705 MB** |
+| 8K | 20,398 MB | **18,988 MB** | **1.4 GB** |
+| 16K | 22,414 MB | **19,396 MB** | **3.0 GB** |
 
-### Memory
+At 16K context, TurboQuant saves **3 GB** of peak GPU memory. Savings grow with context length because the 5x-compressed cache scales much better than FP16.
 
-Peak GPU memory is **at parity** with standard — TurboQuant does not use more memory:
+### 32B Model — Speed
 
-| Prompt Length | Standard | TurboQuant | Difference |
+| Prompt | Standard | TurboQuant | Speedup |
 |:---:|:---:|:---:|:---:|
-| 1K | 18,402 MB | 18,347 MB | +55 MB saved |
-| 4K | 19,490 MB | 19,482 MB | +8 MB saved |
-| 8K | 20,398 MB | 20,538 MB | -140 MB |
-| 16K | 22,414 MB | 22,555 MB | -142 MB |
+| 1K | 6.6 tok/s | **7.8 tok/s** | **1.2x** |
+| 2K | 7.4 tok/s | **7.8 tok/s** | **1.1x** |
+| 4K | 7.1 tok/s | 7.1 tok/s | 1.0x |
+| 8K | 6.2 tok/s | **7.8 tok/s** | **1.3x** |
+| 16K | 5.7 tok/s | **7.4 tok/s** | **1.3x** |
 
-> **Note:** Peak memory is currently at parity, not lower, because compression starts after prefill (all prompt tokens sit in an FP16 buffer during prefill, same as standard). The compressed cache IS 5x smaller — the savings become visible in very long conversations that grow well beyond the initial prompt. Incremental compression during prefill (to get peak memory below standard) is planned.
+### 3B Model — Speed & Memory (Qwen2.5-3B-Instruct-4bit)
 
-### Quality
+| Context | Standard | TurboQuant | Speed | Quality |
+|---------|:---:|:---:|:---:|:---:|
+| Short (36 tok) | 83.0 tok/s | 59.8 tok/s | 72% | **100% match** |
+| Medium (690 tok) | 59.5 tok/s | **69.8 tok/s** | **117%** | **100% match** |
+| Long (1130 tok) | 63.1 tok/s | **70.6 tok/s** | **112%** | **100% match** |
 
-Output is **100% identical** to standard FP16 inference at 3-bit compression:
-
-| Model | Short (36 tok) | Medium (690 tok) | Long (1130 tok) |
-|:---:|:---:|:---:|:---:|
-| Qwen2.5-3B | 100% match | 100% match | 100% match |
-| Qwen2.5-32B | 100% match | 100% match | 100% match |
+| Context | Standard Peak | TurboQuant Peak | Saved |
+|---------|:---:|:---:|:---:|
+| Medium (690 tok) | 2,267 MB | **1,751 MB** | **516 MB** |
+| Long (1130 tok) | 2,589 MB | **1,805 MB** | **785 MB** |
 
 ### KV Cache Compression Ratio
 
@@ -45,16 +48,6 @@ Output is **100% identical** to standard FP16 inference at 3-bit compression:
 | 1,024 | 128 MB | 38 MB | 3.4x |
 | 4,096 | 512 MB | 113 MB | 4.5x |
 | 16,384 | 2,048 MB | 413 MB | **5.0x** |
-
-### What we fixed (development history)
-
-Early versions of TurboQuant used Python-level Metal kernels that caused a **7.5 GB memory regression** at 16K context due to MLX lazy evaluation keeping compression intermediates alive. We fixed this by:
-
-1. Building a **native C++/Metal kernel** (`mx.fast.turboquant_attention`) inside a fork of Apple's MLX — computes attention directly on compressed data at the GPU level with zero Python overhead
-2. Adding **`mx.eval()` during the compression flush** to release intermediates eagerly instead of accumulating them
-3. Adding a **2-pass kernel** for long sequences (N >= 1024) following MLX's `sdpa_vector_2pass` pattern
-
-Result: **98% of the memory regression eliminated** (from +7.5 GB to -142 MB).
 
 ## How it works
 
