@@ -354,10 +354,26 @@ def _patch_attention():
         mask=None,
         sinks=None,
     ):
-        # Route through Metal kernel attention ONLY for decode (n_q=1)
-        # with compressed data. Prefill (n_q>1) uses standard attention
-        # because Metal kernels loop per query position and are slower.
         n_q = queries.shape[2]
+
+        # Skip TQ for short contexts where Metal kernel dispatch overhead
+        # exceeds the bandwidth savings from compressed data. Standard SDPA
+        # is faster when there are few compressed tokens.
+        _MIN_COMPRESSED_FOR_TQ = 256
+        if (isinstance(cache, TurboQuantCache)
+            and cache._keys_compressed is not None
+            and cache.compressed_tokens < _MIN_COMPRESSED_FOR_TQ
+            and n_q == 1):
+            # Few compressed tokens: decompress and use standard (faster)
+            all_keys = cache._get_all_keys()
+            all_values = cache._get_all_values()
+            return original_sdpa(
+                queries, all_keys, all_values, cache=None,
+                scale=scale, mask=mask, sinks=sinks,
+            )
+
+        # Route through Metal kernel attention for decode (n_q=1)
+        # with enough compressed data for TQ to be worthwhile.
         if (isinstance(cache, TurboQuantCache)
             and cache._keys_compressed is not None
             and n_q == 1):
