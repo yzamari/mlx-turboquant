@@ -134,12 +134,37 @@ mlx-tq-chat --model mlx-community/Qwen2.5-3B-Instruct-4bit
 
 # Chat with a 32B model
 mlx-tq-chat --model mlx-community/Qwen2.5-32B-Instruct-4bit --key-bits 3
-
-# Without TurboQuant (for comparison)
-mlx-tq-chat --model mlx-community/Qwen2.5-3B-Instruct-4bit --no-turboquant
 ```
 
 Inside the chat, use `/reset` to clear conversation history, `/help` for commands, `/quit` to exit.
+
+**Note:** The first run is slow (~2 tok/s) because Metal shaders are being compiled and the model is downloading. Subsequent runs will be much faster (30-50+ tok/s for 3B) as everything is cached.
+
+### Comparing With and Without TurboQuant
+
+To see the actual speed difference, run both modes **after** the first warm-up run (so Metal compilation is cached):
+
+```bash
+# Run 1: TurboQuant ON (default)
+mlx-tq-chat --model mlx-community/Qwen2.5-3B-Instruct-4bit
+
+# Run 2: TurboQuant OFF (standard KV cache)
+mlx-tq-chat --model mlx-community/Qwen2.5-3B-Instruct-4bit --no-turboquant
+```
+
+The speed difference is **small on short conversations** with the 3B model. TurboQuant's advantage shows at:
+
+- **Long conversations** (1K+ tokens of context) — compressed cache uses less memory bandwidth
+- **Large models** (32B) — inference is memory-bandwidth-bound, so reading 3-bit data instead of 16-bit is a big win
+- **Long prompts** — paste a long document, then ask questions about it
+
+For a quantitative comparison, use the benchmark:
+
+```bash
+python -m mlx_turboquant.benchmark --model mlx-community/Qwen2.5-3B-Instruct-4bit
+```
+
+This runs the same prompt with Standard, MLX-LM Quantized, and TurboQuant caches side-by-side and reports tok/s, memory, and output for each.
 
 ### API Server (OpenAI-compatible)
 
