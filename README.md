@@ -119,11 +119,48 @@ git clone https://github.com/yzamari/mlx-turboquant.git
 cd mlx-turboquant
 python3.12 -m venv venv && source venv/bin/activate
 pip install -e ".[dev]"
+
+# For the API server (adds FastAPI + uvicorn)
+pip install -e ".[server]"
 ```
 
 ## Quick Start
 
-### CLI
+### Chat (like Ollama)
+
+```bash
+# Chat with any model — TurboQuant compression is automatic
+mlx-tq-chat --model mlx-community/Qwen2.5-3B-Instruct-4bit
+
+# Chat with a 32B model
+mlx-tq-chat --model mlx-community/Qwen2.5-32B-Instruct-4bit --key-bits 3
+
+# Without TurboQuant (for comparison)
+mlx-tq-chat --model mlx-community/Qwen2.5-3B-Instruct-4bit --no-turboquant
+```
+
+Inside the chat, use `/reset` to clear conversation history, `/help` for commands, `/quit` to exit.
+
+### API Server (OpenAI-compatible)
+
+```bash
+# Start the server
+mlx-tq-server --model mlx-community/Qwen2.5-3B-Instruct-4bit --port 8000
+
+# Use with curl
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen","messages":[{"role":"user","content":"hello"}]}'
+
+# Streaming
+curl -N http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen","messages":[{"role":"user","content":"hello"}],"stream":true}'
+```
+
+Works with any OpenAI-compatible client — set the base URL to `http://localhost:8000/v1`.
+
+### CLI (single prompt)
 
 ```bash
 mlx-tq-generate --model mlx-community/Qwen2.5-3B-Instruct-4bit \
@@ -273,7 +310,7 @@ TurboQuant is **lossy compression** (like JPEG for images). It preserves generat
 | Repo | Purpose |
 |------|---------|
 | [turboQuantPlayground](https://github.com/yzamari/turboQuantPlayground) | Core TurboQuant algorithm, Metal kernels, educational notebooks |
-| [mlx-turboquant](https://github.com/yzamari/mlx-turboquant) (this repo) | MLX-LM integration for real inference |
+| [mlx-turboquant](https://github.com/yzamari/mlx-turboquant) (this repo) | MLX-LM integration: chat, API server, inference |
 | [mlx-fork](https://github.com/yzamari/mlx-fork/tree/feature/turboquant-attention) | Fork of Apple's MLX with native `mx.fast.turboquant_attention()` kernel |
 | [turboquant-bench](https://github.com/yzamari/turboquant-bench) | All-in-one comparison benchmarks |
 
