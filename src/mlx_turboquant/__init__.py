@@ -11,10 +11,12 @@ __version__ = "0.1.0"
 from mlx_turboquant.cache import TurboQuantCache
 from mlx_turboquant.patch import patch_model, make_turboquant_cache
 from mlx_turboquant.generate import generate
+from mlx_turboquant._session import InferenceSession
 
 __all__ = [
     "TurboQuantCache",
     "patch_model",
     "make_turboquant_cache",
     "generate",
+    "InferenceSession",
 ]

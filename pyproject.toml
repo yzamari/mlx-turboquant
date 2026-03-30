@@ -19,9 +19,12 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
+server = ["fastapi>=0.110", "uvicorn>=0.29", "httpx>=0.27"]
 
 [project.scripts]
 mlx-tq-generate = "mlx_turboquant.cli:main"
+mlx-tq-chat = "mlx_turboquant.chat:main"
+mlx-tq-server = "mlx_turboquant.server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
