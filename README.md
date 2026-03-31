@@ -182,8 +182,10 @@ Results on M4 Pro 48GB (Qwen2.5-3B-Instruct-4bit):
 | 8K | 73.3 tok/s | 117.6 tok/s | **1.6x** |
 | 16K | 57.8 tok/s | 113.4 tok/s | **2.0x** |
 | 32K | 27.9 tok/s | 110.4 tok/s | **4.0x** |
+| 64K | 21.9 tok/s | 98.6 tok/s | **4.5x** |
+| 128K | 13.5 tok/s | 94.3 tok/s | **7.0x** |
 
-Standard generation speed degrades linearly as context grows (83 → 28 tok/s). TurboQuant stays flat (~110 tok/s) because it reads compressed 3-bit data instead of 16-bit FP16.
+Standard generation speed degrades linearly as context grows (83 → 13 tok/s). TurboQuant stays flat (~95-110 tok/s) because it reads compressed 3-bit data instead of 16-bit FP16. **7x faster at 128K context.**
 
 ### API Server (OpenAI-compatible)
 
