@@ -166,6 +166,25 @@ python -m mlx_turboquant.benchmark --model mlx-community/Qwen2.5-3B-Instruct-4bi
 
 This runs the same prompt with Standard, MLX-LM Quantized, and TurboQuant caches side-by-side and reports tok/s, memory, and output for each.
 
+### Long-Context Stress Test
+
+Push your Mac to its limits — tests progressively longer contexts and shows where TurboQuant shines:
+
+```bash
+python benchmarks/bench_long_context.py --model mlx-community/Qwen2.5-3B-Instruct-4bit
+```
+
+Results on M4 Pro 48GB (Qwen2.5-3B-Instruct-4bit):
+
+| Context | Standard | TurboQuant | Speedup |
+|:---:|:---:|:---:|:---:|
+| 4K | 83.5 tok/s | 111.8 tok/s | **1.3x** |
+| 8K | 73.3 tok/s | 117.6 tok/s | **1.6x** |
+| 16K | 57.8 tok/s | 113.4 tok/s | **2.0x** |
+| 32K | 27.9 tok/s | 110.4 tok/s | **4.0x** |
+
+Standard generation speed degrades linearly as context grows (83 → 28 tok/s). TurboQuant stays flat (~110 tok/s) because it reads compressed 3-bit data instead of 16-bit FP16.
+
 ### API Server (OpenAI-compatible)
 
 ```bash
