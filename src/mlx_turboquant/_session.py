@@ -40,6 +40,7 @@ class InferenceSession:
         self.model = None
         self.tokenizer = None
         self._messages: list[dict] = []
+        self._cache = None
         self._lock = threading.Lock()
 
     @property
@@ -53,8 +54,9 @@ class InferenceSession:
         self.model, self.tokenizer = mlx_lm.load(self.model_path)
 
     def reset(self):
-        """Clear conversation history to start a fresh chat."""
+        """Clear conversation history and cached KV state."""
         self._messages = []
+        self._cache = None
 
     def _build_prompt(self, messages: list[dict]) -> str:
         """Format messages list into a string using the tokenizer's chat template."""
@@ -80,6 +82,18 @@ class InferenceSession:
             buffer_size=self.buffer_size,
         )
 
+    def _get_continuation_tokens(self) -> list[int]:
+        """Get only the NEW tokens not yet in the cache.
+
+        Tokenizes the full conversation, then strips the prefix that's
+        already cached (using the cache's token offset). Works correctly
+        regardless of chat template format or EOS token handling.
+        """
+        full_prompt = self._build_prompt(self._messages)
+        full_tokens = self.tokenizer.encode(full_prompt)
+        cached_offset = self._cache[0].offset
+        return full_tokens[cached_offset:]
+
     def generate_response(
         self,
         user_message: str,
@@ -93,21 +107,31 @@ class InferenceSession:
         After the generator is exhausted, the assistant message is appended
         to self._messages.
 
+        On the first turn, creates a fresh cache and processes the full
+        prompt. On subsequent turns, reuses the existing cache and only
+        processes the new user message tokens (using token offset).
+
         Thread-safe via self._lock.
         """
         with self._lock:
             self._messages.append({"role": "user", "content": user_message})
-            formatted = self._build_prompt(self._messages)
-            cache = self._make_cache()
+
+            if self._cache is None:
+                # First turn: full conversation string, fresh cache
+                prompt = self._build_prompt(self._messages)
+                self._cache = self._make_cache()
+            else:
+                # Subsequent turns: only new token IDs, reuse cache
+                prompt = self._get_continuation_tokens()
 
             sampler = make_sampler(temp=temp, top_p=top_p)
             gen_kwargs = dict(max_tokens=max_tokens, sampler=sampler)
-            if cache is not None:
-                gen_kwargs["prompt_cache"] = cache
+            if self._cache is not None:
+                gen_kwargs["prompt_cache"] = self._cache
 
             full_text = ""
             for response in mlx_lm.stream_generate(
-                self.model, self.tokenizer, formatted, **gen_kwargs
+                self.model, self.tokenizer, prompt, **gen_kwargs
             ):
                 full_text += response.text
                 yield response
